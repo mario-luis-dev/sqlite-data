@@ -1087,30 +1087,23 @@
       guard !changes.isEmpty
       else { return nil }
 
+      // NB: This comparator must be a strict weak ordering: records of an unknown table sort as
+      //     if they had no parents, so they cannot reorder the records around them.
+      func tableIndex(of recordID: CKRecord.ID) -> Int {
+        recordID.tableName.flatMap { tablesByOrder[$0] } ?? -1
+      }
       changes.sort { lhs, rhs in
         switch (lhs, rhs) {
         case (.saveRecord(let lhs), .saveRecord(let rhs)):
-          guard
-            let lhsRecordType = lhs.tableName,
-            let lhsIndex = tablesByOrder[lhsRecordType],
-            let rhsRecordType = rhs.tableName,
-            let rhsIndex = tablesByOrder[rhsRecordType]
-          else { return true }
-          return lhsIndex < rhsIndex
+          return tableIndex(of: lhs) < tableIndex(of: rhs)
         case (.deleteRecord(let lhs), .deleteRecord(let rhs)):
-          guard
-            let lhsRecordType = lhs.tableName,
-            let lhsIndex = tablesByOrder[lhsRecordType],
-            let rhsRecordType = rhs.tableName,
-            let rhsIndex = tablesByOrder[rhsRecordType]
-          else { return true }
-          return lhsIndex > rhsIndex
+          return tableIndex(of: lhs) > tableIndex(of: rhs)
         case (.saveRecord, .deleteRecord):
           return false
         case (.deleteRecord, .saveRecord):
           return true
         default:
-          return true
+          return false
         }
       }
 
@@ -1703,6 +1696,19 @@
           await clearServerRecord()
 
         case .referenceViolation:
+          // NB: The server does not have this record's parent. That only means the parent was
+          //     deleted if the server ever confirmed it. A parent the server never confirmed is
+          //     still on its way (an earlier batch that hasn't landed, a concurrent send, or a
+          //     save that was dropped), so applying the 'ON DELETE' action here would destroy the
+          //     child and every record that cascades from it. Queue both again instead: parents
+          //     sort before their children, so the parent is sent first.
+          if let parentRecordID = failedRecord.parent?.recordID,
+            await isAwaitingFirstUpload(parentRecordID)
+          {
+            newPendingRecordZoneChanges.append(.saveRecord(parentRecordID))
+            newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+            continue
+          }
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType],
@@ -1998,6 +2004,23 @@
         }
         try open(table)
       }
+    }
+
+    /// Whether a record exists locally but the server has never confirmed a save of it.
+    ///
+    /// Only records returned by the server carry a change tag. A last known server record without
+    /// one was built locally for a send that never succeeded.
+    private func isAwaitingFirstUpload(_ recordID: CKRecord.ID) async -> Bool {
+      await withErrorReporting(.sqliteDataCloudKitFailure) {
+        try await metadatabase.read { db in
+          guard
+            let metadata = try SyncMetadata.find(recordID).fetchOne(db),
+            !metadata._isDeleted
+          else { return false }
+          return !(metadata.lastKnownServerRecord?.hasServerChangeTag ?? false)
+        }
+      }
+        ?? false
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {
@@ -2420,6 +2443,12 @@
     var result: [String: Int] = [:]
     for table in tableDependencies.keys {
       try visit(table: table)
+    }
+    // NB: Tables that neither reference nor are referenced by another synchronized table still
+    //     need a position. Without one, the comparator that sorts pending changes is not a strict
+    //     weak ordering, and the sort can send a child record before its parent.
+    for table in tables {
+      try visit(table: HashableSynchronizedTable(table))
     }
     return result
 

@@ -22,6 +22,7 @@
             "modelBs": 9,
             "modelCs": 10,
             "remindersListPrivates": 11,
+            "scopedModels": 12,
           ]
         )
       }

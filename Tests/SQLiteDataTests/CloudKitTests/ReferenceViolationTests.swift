@@ -11,6 +11,169 @@
   extension BaseCloudKitTests {
     @MainActor
     final class ReferenceViolationTests: BaseCloudKitTests, @unchecked Sendable {
+      // * Local client creates a list and a reminder in it.
+      // * The reminder is sent before the list has ever reached the server (a separate batch,
+      //   a concurrent send, or a batch size limit), so the server rejects it with a reference
+      //   violation.
+      // => The reminder is kept, and both records are uploaded on the next send.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func childSentBeforeParentWasEverUploaded() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+
+        try await syncEngine.processPendingRecordZoneChanges(
+          options: CKSyncEngine.SendChangesOptions(
+            scope: .recordIDs([Reminder.recordID(for: 1)])
+          ),
+          scope: .private
+        )
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [Reminder(id: 1, title: "Get milk", remindersListID: 1)]
+          )
+          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
+        }
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        assertInlineSnapshot(of: container, as: .customDump) {
+          """
+          MockCloudContainer(
+            privateCloudDatabase: MockCloudDatabase(
+              databaseScope: .private,
+              storage: [
+                [0]: CKRecord(
+                  recordID: CKRecord.ID(1:reminders/zone/__defaultOwner__),
+                  recordType: "reminders",
+                  parent: CKReference(recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__)),
+                  share: nil,
+                  id: 1,
+                  isCompleted: 0,
+                  remindersListID: 1,
+                  title: "Get milk"
+                ),
+                [1]: CKRecord(
+                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                  recordType: "remindersLists",
+                  parent: nil,
+                  share: nil,
+                  id: 1,
+                  title: "Personal"
+                )
+              ]
+            ),
+            sharedCloudDatabase: MockCloudDatabase(
+              databaseScope: .shared,
+              storage: []
+            )
+          )
+          """
+        }
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [Reminder(id: 1, title: "Get milk", remindersListID: 1)]
+          )
+          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
+        }
+      }
+
+      // * Local client creates a list and a reminder in it.
+      // * The list's pending save is lost before it is sent (for example, a save that failed with
+      //   a non-retryable error is dropped from the queue).
+      // * The reminder is sent and rejected with a reference violation.
+      // => The reminder is kept, the list is queued again, and both are uploaded.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func childSentAfterParentSaveWasDropped() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        syncEngine.private.state.remove(
+          pendingRecordZoneChanges: [.saveRecord(RemindersList.recordID(for: 1))]
+        )
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [Reminder(id: 1, title: "Get milk", remindersListID: 1)]
+          )
+          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
+        }
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        assertInlineSnapshot(of: container, as: .customDump) {
+          """
+          MockCloudContainer(
+            privateCloudDatabase: MockCloudDatabase(
+              databaseScope: .private,
+              storage: [
+                [0]: CKRecord(
+                  recordID: CKRecord.ID(1:reminders/zone/__defaultOwner__),
+                  recordType: "reminders",
+                  parent: CKReference(recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__)),
+                  share: nil,
+                  id: 1,
+                  isCompleted: 0,
+                  remindersListID: 1,
+                  title: "Get milk"
+                ),
+                [1]: CKRecord(
+                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                  recordType: "remindersLists",
+                  parent: nil,
+                  share: nil,
+                  id: 1,
+                  title: "Personal"
+                )
+              ]
+            ),
+            sharedCloudDatabase: MockCloudDatabase(
+              databaseScope: .shared,
+              storage: []
+            )
+          )
+          """
+        }
+      }
+
+      // * Local client creates a list, a reminder in it, and an unrelated row in a table with no
+      //   foreign keys.
+      // => The next batch sends every list before any reminder.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func batchSendsParentsFirstWhenTableWithoutForeignKeysIsPending() async throws {
+        try await userDatabase.userWrite { db in
+          for id in 1...30 {
+            try RemindersList.insert { RemindersList(id: id, title: "List \(id)") }.execute(db)
+          }
+          for id in 1...30 {
+            try ScopedModel.insert { ScopedModel(id: id, title: "Model \(id)") }.execute(db)
+          }
+          for id in 1...30 {
+            try Reminder.insert {
+              Reminder(id: id, title: "Reminder \(id)", remindersListID: id)
+            }
+            .execute(db)
+          }
+        }
+
+        let batch = try #require(
+          await syncEngine.nextRecordZoneChangeBatch(syncEngine: syncEngine.private)
+        )
+        let recordTypes = batch.recordsToSave.map(\.recordType)
+        let lastListIndex = try #require(recordTypes.lastIndex(of: RemindersList.tableName))
+        let firstReminderIndex = try #require(recordTypes.firstIndex(of: Reminder.tableName))
+        #expect(lastListIndex < firstReminderIndex)
+      }
+
       // * Local client moves a reminder to a list.
       // * At same time, remote deletes that list.
       // => When data is synchronized the reminder and list are deleted.
