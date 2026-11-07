@@ -628,6 +628,7 @@
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
       try await enqueueLocallyPendingChanges()
+      try await enqueueUnconfirmedDeletions()
       try await userDatabase.write { db in
         try PendingRecordZoneChange.delete().execute(db)
 
@@ -660,6 +661,63 @@
       syncEngines.withValue {
         $0.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
         $0.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+      }
+    }
+
+    /// Queues again the local deletions that CloudKit hasn't confirmed.
+    ///
+    /// A deletion keeps its metadata, flagged with `_isDeleted`, until it leaves the queue (see
+    /// `removeDeletionMetadata`), but the queue lives in CKSyncEngine's saved state, which can be
+    /// lost, or saved before the deletion was queued. A deletion missing from it is never sent:
+    /// the record stays on the server while the row is gone from the device, and a row created
+    /// again with the same primary key is never uploaded. CKSyncEngine deduplicates pending
+    /// changes, so a deletion that is still queued is unaffected.
+    ///
+    /// Called after the changes made while the engine was stopped are queued: the deletion queued
+    /// last wins over a save of the same record, and the row created again is uploaded once the
+    /// deletion is confirmed.
+    private func enqueueUnconfirmedDeletions() async throws {
+      // NB: No index covers '_isDeleted', so the deletions are found on a reader, where the scan
+      //     cannot hold up writes. They are queued in a write, which cannot interleave with the
+      //     confirmation of one of them: a deletion confirmed in the meantime has lost its flag,
+      //     and queueing it again would discard the upload of a row created again since.
+      let recordNames = try await metadatabase.read { db in
+        try SyncMetadata
+          .where(\._isDeleted)
+          .select(\.recordName)
+          .fetchAll(db)
+      }
+      guard !recordNames.isEmpty
+      else { return }
+      try await userDatabase.write { db in
+        let deletions =
+          try SyncMetadata
+          .where { $0.recordName.in(recordNames) && $0._isDeleted }
+          .select { ($0.recordName, $0.zoneName, $0.ownerName, $0.lastKnownServerRecord, $0.share) }
+          .fetchAll(db)
+        var privateChanges: [CKSyncEngine.PendingRecordZoneChange] = []
+        var sharedChanges: [CKSyncEngine.PendingRecordZoneChange] = []
+        for (recordName, zoneName, ownerName, lastKnownServerRecord, share) in deletions {
+          // NB: The same changes, and the same engine, as 'didDelete' queued them.
+          let zoneID =
+            lastKnownServerRecord?.recordID.zoneID
+            ?? CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
+          var changes: [CKSyncEngine.PendingRecordZoneChange] = [
+            .deleteRecord(CKRecord.ID(recordName: recordName, zoneID: zoneID))
+          ]
+          if let share {
+            changes.append(.deleteRecord(share.recordID))
+          }
+          if zoneID.ownerName == CKCurrentUserDefaultName {
+            privateChanges.append(contentsOf: changes)
+          } else {
+            sharedChanges.append(contentsOf: changes)
+          }
+        }
+        syncEngines.withValue { [privateChanges, sharedChanges] in
+          $0.private?.state.add(pendingRecordZoneChanges: privateChanges)
+          $0.shared?.state.add(pendingRecordZoneChanges: sharedChanges)
+        }
       }
     }
 
