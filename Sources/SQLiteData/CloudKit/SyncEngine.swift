@@ -666,8 +666,10 @@
     private func enqueueUnknownRecordsForCloudKit() async throws {
       try await userDatabase.write { db in
         try $_isSynchronizingChanges.withValue(false) {
+          // NB: Touching the metadata of a record deleted locally would queue a save of it, and
+          //     CKSyncEngine discards a pending deletion when a save of the same record follows it.
           try SyncMetadata
-            .where { !$0.hasLastKnownServerRecord }
+            .where { !$0.hasLastKnownServerRecord && !$0._isDeleted }
             .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
             .execute(db)
         }
@@ -713,9 +715,11 @@
             previousRecordType?.tableInfo ?? []
           )
           .map(\.name)
+          // NB: Records deleted locally, whose deletions are still waiting for confirmation, must not
+          //     be written back.
           let lastKnownServerRecords = try await metadatabase.read { db in
             try SyncMetadata
-              .where { $0.recordType.eq(tableName) }
+              .where { $0.recordType.eq(tableName) && !$0._isDeleted }
               .select(\._lastKnownServerRecordAllFields)
               .fetchAll(db)
           }
@@ -1248,6 +1252,7 @@
           return nil
         }
       }
+      var droppedDeletionRecordIDs: [CKRecord.ID] = []
 
       if syncEngine.database.databaseScope == .shared {
         let (sharesToDelete, recordsWithRoot):
@@ -1318,17 +1323,20 @@
           syncEngine.state.remove(
             pendingRecordZoneChanges: [.deleteRecord(lastKnownServerRecord.recordID)]
           )
+          droppedDeletionRecordIDs.append(lastKnownServerRecord.recordID)
         }
       }
 
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard !deletedRecordIDs.isEmpty
+      // NB: The metadata of a deletion in this batch stays until the deletion leaves the queue (see
+      //     'handleSentRecordZoneChanges'): the batch may not reach the server (CloudKit throttles
+      //     it, the network drops, the app is closed), and a fetch in the meantime must still see
+      //     that the record is deleted locally. Deletions dropped above are never sent, because
+      //     deleting their share deletes them, so their metadata goes now.
+      await withErrorReporting(.sqliteDataCloudKitFailure) { [droppedDeletionRecordIDs] in
+        guard !droppedDeletionRecordIDs.isEmpty
         else { return }
         try await userDatabase.write { db in
-          try SyncMetadata
-            .findAll(deletedRecordIDs)
-            .delete()
-            .execute(db)
+          try removeDeletionMetadata(for: droppedDeletionRecordIDs, db: db)
         }
       }
 
@@ -1433,6 +1441,14 @@
           }
           open(table)
         }
+        // NB: Rows deleted locally are already gone, but their deletions may still be waiting for
+        //     confirmation. The zone is gone, so their metadata can go too.
+        try SyncMetadata
+          .where {
+            $0.zoneName.eq(zoneID.zoneName) && $0.ownerName.eq(zoneID.ownerName) && $0._isDeleted
+          }
+          .delete()
+          .execute(db)
       }
       @Sendable
       func uploadRecords(in zoneID: CKRecordZone.ID, db: Database) throws {
@@ -1496,6 +1512,13 @@
 
                 try UnsyncedRecordID
                   .findAll(recordIDs)
+                  .delete()
+                  .execute(db)
+
+                // NB: The record was deleted locally too, and its deletion is still waiting for
+                //     confirmation. The server deleted it, so its metadata can go now.
+                try SyncMetadata
+                  .where { $0.recordName.in(recordIDs.map(\.recordName)) && $0._isDeleted }
                   .delete()
                   .execute(db)
               }
@@ -1658,11 +1681,36 @@
         await refreshLastKnownServerRecord(savedRecord)
       }
 
+      // NB: A record deleted locally after its save was sent must not be queued to be saved again:
+      //     its deletion is queued, and CKSyncEngine discards a pending deletion when a save of the
+      //     same record is added after it, so the deletion would never be sent.
+      let pendingDeletionRecordNames: Set<String> =
+        await withErrorReporting(.sqliteDataCloudKitFailure) { () async throws -> Set<String> in
+          guard !failedRecordSaves.isEmpty
+          else { return [] }
+          let recordNames = failedRecordSaves.map(\.record.recordID.recordName)
+          return try await metadatabase.read { db in
+            Set(
+              try SyncMetadata
+                .where { $0.recordName.in(recordNames) && $0._isDeleted }
+                .select(\.recordName)
+                .fetchAll(db)
+            )
+          }
+        }
+        ?? []
+
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
       defer {
         syncEngine.state.add(pendingDatabaseChanges: newPendingDatabaseChanges)
-        syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
+        syncEngine.state.add(
+          pendingRecordZoneChanges: newPendingRecordZoneChanges.filter {
+            guard case .saveRecord(let recordID) = $0
+            else { return true }
+            return !pendingDeletionRecordNames.contains(recordID.recordName)
+          }
+        )
       }
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
@@ -1852,6 +1900,29 @@
                 break
               }
             }
+
+            // NB: A deletion keeps its metadata until it leaves the queue. Confirmed deletions
+            //     leave it now. A failed deletion stays queued only when CloudKit retries its error
+            //     (CKSyncEngine keeps those pending) or when it was queued again above; any other
+            //     failure drops it, so its metadata goes as well and a later fetch of the record can
+            //     bring the row back, as it did before deletions kept their metadata. A reference
+            //     violation drops its metadata too, before the record is fetched again below.
+            let queuedRecordZoneChanges =
+              failedRecordDeletes.isEmpty
+              ? []
+              : Set(syncEngine.state.pendingRecordZoneChanges)
+            let finishedDeletionRecordIDs =
+              deletedRecordIDs
+              + failedRecordDeletes.compactMap { failedRecordID, error in
+                let staysQueued =
+                  queuedRecordZoneChanges.contains(.deleteRecord(failedRecordID))
+                  && Self.queuedDeletionErrorCodes.contains(error.code)
+                return staysQueued ? nil : failedRecordID
+              }
+            try removeDeletionMetadata(for: finishedDeletionRecordIDs, db: db)
+            if !deletedRecordIDs.isEmpty {
+              try UnsyncedRecordID.findAll(deletedRecordIDs).delete().execute(db)
+            }
             return enqueuedUnsyncedRecordID
           }
         }
@@ -1960,6 +2031,15 @@
           return
         }
 
+        // NB: A local deletion of this record is still waiting to be sent or confirmed, and it
+        //     wins (its metadata stays until then, see 'removeDeletionMetadata'). Writing the
+        //     server record would bring the row back while the deletion stays queued: once it is
+        //     sent the server record is gone but the local row stays, without metadata, and the
+        //     device no longer matches the server. Fetches can deliver this record at any time,
+        //     including this device's own earlier saves when its change token predates them.
+        guard force || !metadata._isDeleted
+        else { return }
+
         serverRecord.userModificationTime = metadata.userModificationTime
 
         func open<T>(_ table: some SynchronizableTable<T>) throws {
@@ -2003,6 +2083,74 @@
           }
         }
         try open(table)
+      }
+    }
+
+    /// The errors after which a failed deletion stays queued.
+    ///
+    /// CKSyncEngine keeps a change pending when it fails for a reason it retries itself, such as a
+    /// network failure or the rate limit, and drops it otherwise. `batchRequestFailed` deletions are
+    /// queued again by `handleSentRecordZoneChanges`.
+    private static let queuedDeletionErrorCodes: Set<CKError.Code> = [
+      .batchRequestFailed,
+      .networkFailure,
+      .networkUnavailable,
+      .notAuthenticated,
+      .operationCancelled,
+      .requestRateLimited,
+      .serviceUnavailable,
+      .zoneBusy,
+    ]
+
+    /// Removes the metadata of local deletions that will not be sent again.
+    ///
+    /// A deletion keeps its metadata, flagged with `_isDeleted`, until it leaves the queue, so that
+    /// a fetch cannot write the deleted row back while the deletion is on its way (see
+    /// `upsertFromServerRecord`). A row created again with the same primary key while its deletion
+    /// was pending is queued to be uploaded as a new record, as it would have been had the deletion
+    /// already left the queue.
+    private func removeDeletionMetadata(
+      for recordIDs: some Collection<CKRecord.ID>,
+      db: Database
+    ) throws {
+      guard !recordIDs.isEmpty
+      else { return }
+      // NB: Matched by record name alone: a zone change can move the metadata of a deleted record
+      //     away from the zone its deletion was queued in, and it must not stay behind.
+      let recordNames = recordIDs.map(\.recordName)
+      let deletedRecords =
+        try SyncMetadata
+        .where { $0.recordName.in(recordNames) && $0._isDeleted }
+        .select { ($0.recordType, $0.recordPrimaryKey) }
+        .fetchAll(db)
+      guard !deletedRecords.isEmpty
+      else { return }
+      try SyncMetadata
+        .where { $0.recordName.in(recordNames) && $0._isDeleted }
+        .delete()
+        .execute(db)
+
+      let primaryKeysByRecordType = Dictionary(grouping: deletedRecords, by: \.0)
+        .mapValues { $0.map(\.1) }
+      $_isSynchronizingChanges.withValue(false) {
+        for (recordType, primaryKeys) in primaryKeysByRecordType {
+          guard let table = tablesByName[recordType]
+          else { continue }
+          func open<T>(_: some SynchronizableTable<T>) {
+            withErrorReporting(.sqliteDataCloudKitFailure) {
+              let primaryKeys: QueryFragment = primaryKeys.map { "\(bind: $0)" }
+                .joined(separator: ", ")
+              try #sql(
+                """
+                UPDATE \(T.self) SET \(quote: T.primaryKey.name) = \(quote: T.primaryKey.name)
+                WHERE \(quote: T.primaryKey.name) IN (\(primaryKeys))
+                """
+              )
+              .execute(db)
+            }
+          }
+          open(table)
+        }
       }
     }
 

@@ -95,8 +95,8 @@
     @Column(as: CKShare?.SystemFieldsRepresentation.self)
     public let share: CKShare?
 
-    /// Determines if the metadata has been "soft" deleted. It will be fully deleted once the
-    /// next batch of pending changes is processed.
+    /// Determines if the metadata has been "soft" deleted. It will be fully deleted once CloudKit
+    /// confirms the deletion of the record, or the deletion leaves the queue for another reason.
     public let _isDeleted: Bool
 
     @Column("hasLastKnownServerRecord", generated: .virtual)
