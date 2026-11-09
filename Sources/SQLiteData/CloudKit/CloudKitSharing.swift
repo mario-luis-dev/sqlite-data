@@ -241,6 +241,7 @@
     }
 
     func unshare(share: CKShare) async throws {
+      await engineCreation()
       let result = try await syncEngines.private?.database.modifyRecords(
         saving: [],
         deleting: [share.recordID]

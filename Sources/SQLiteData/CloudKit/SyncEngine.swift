@@ -44,6 +44,7 @@
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    private let startup = LockIsolated(Startup())
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
@@ -429,16 +430,33 @@
     /// All edits made after stopping the sync engine will not be synchronized to CloudKit.
     /// You must start the sync engine again using ``start()`` to synchronize the changes.
     public func stop() {
-      guard isRunning else { return }
+      let (isStarting, runningGeneration) = startup.withValue { startup in
+        let isStarting = startup.pending?.generation == startup.generation
+        // NB: A start still creating its sync engines throws them away once they are created.
+        startup.generation += 1
+        return (
+          isStarting,
+          syncEngines.withValue(\.isRunning) ? startup.generation : nil
+        )
+      }
+      guard isStarting || runningGeneration != nil
+      else { return }
       #if DEBUG && canImport(DeveloperToolsSupport)
         previewTimerTask.withValue {
           $0?.cancel()
           $0 = nil
         }
       #endif
+      guard let runningGeneration
+      else { return }
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          $0 = SyncEngines()
+        startup.withValue { startup in
+          // NB: Another stop since, and maybe a start after it, has the last word.
+          guard startup.generation == runningGeneration
+          else { return }
+          syncEngines.withValue {
+            $0 = SyncEngines()
+          }
         }
       }
     }
@@ -451,16 +469,21 @@
       }
     }
 
+    /// Starts the sync engine, unless it is running or starting.
+    ///
+    /// `CKSyncEngine` decodes the state saved by the previous launch when it is created, and the
+    /// state holds every change still waiting to be sent: 15 MB took 13 to 14 seconds on one
+    /// iPhone, and 30 on an iPhone 12 mini. So the sync engines are created on a task, and put in
+    /// place under the lock of
+    /// `syncEngines` only once they exist. Nothing waits for them: not checking whether sync is
+    /// running, not saving a change (a trigger checks it), not stopping sync, and not the app
+    /// leaving the foreground, all of which can happen on the main thread.
+    ///
+    /// - Returns: The task of the start, which ends once sync is running and has queued the
+    ///   changes waiting to be sent, or once a stop called the start off.
     private func start() throws -> Task<Void, Never> {
-      guard !isRunning else { return Task {} }
-      observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
-          $0 = SyncEngines(
-            private: privateSyncEngine,
-            shared: sharedSyncEngine
-          )
-        }
+      if let task = startup.withValue({ currentStartTask(startup: $0) }) {
+        return task
       }
 
       let previousRecordTypes = try metadatabase.read { db in
@@ -510,6 +533,69 @@
         }
       )
 
+      let (startTask, isNewStart) = startup.withValue {
+        startup -> (Task<Void, Never>, Bool) in
+        if let task = currentStartTask(startup: startup) {
+          return (task, false)
+        }
+        let generation = startup.generation
+        let previousCreation = startup.pending?.creation
+        let creation = Task<Bool, Never> {
+          // NB: A start that a stop called off may still be creating its sync engines, and
+          //     CloudKit expects one sync engine per database.
+          _ = await previousCreation?.value
+          let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
+          return observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+            self.startup.withValue { startup in
+              if startup.pending?.generation == generation {
+                startup.pending = nil
+              }
+              guard startup.generation == generation
+              else { return false }
+              syncEngines.withValue {
+                $0 = SyncEngines(
+                  private: privateSyncEngine,
+                  shared: sharedSyncEngine
+                )
+              }
+              return true
+            }
+          }
+        }
+        let startTask = Task<Void, Never> {
+          guard await creation.value
+          else { return }
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            guard try await container.accountStatus() == .available
+            else { return }
+            runningSyncEngines()?.private.state
+              .add(pendingDatabaseChanges: [.saveZone(defaultZone)])
+            try await uploadRecordsToCloudKit(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await updateLocalFromSchemaChange(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await cacheUserTables(recordTypes: currentRecordTypes)
+          }
+        }
+        startup.pending = PendingStart(
+          generation: generation,
+          creation: creation,
+          task: startTask
+        )
+        // NB: Set before the engines exist, so that fetching and sending changes wait for them.
+        self.startTask.withValue {
+          $0?.cancel()
+          $0 = startTask
+        }
+        return (startTask, true)
+      }
+      guard isNewStart
+      else { return startTask }
+
       #if DEBUG && canImport(DeveloperToolsSupport)
         @Dependency(\.context) var context
         @Dependency(\.continuousClock) var clock
@@ -528,29 +614,22 @@
           }
         }
       #endif
-      let startTask = Task<Void, Never> {
-        await withErrorReporting(.sqliteDataCloudKitFailure) {
-          guard try await container.accountStatus() == .available
-          else { return }
-          syncEngines.withValue {
-            $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
-          }
-          try await uploadRecordsToCloudKit(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await updateLocalFromSchemaChange(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await cacheUserTables(recordTypes: currentRecordTypes)
-        }
-      }
-      self.startTask.withValue {
-        $0?.cancel()
-        $0 = startTask
-      }
       return startTask
+    }
+
+    /// The task of the start in progress, or a finished task when sync is running.
+    private func currentStartTask(startup: Startup) -> Task<Void, Never>? {
+      if let pending = startup.pending, pending.generation == startup.generation {
+        return pending.task
+      }
+      guard syncEngines.withValue(\.isRunning)
+      else { return nil }
+      return Task {}
+    }
+
+    /// Waits until the sync engines being created, if any, are in place or thrown away.
+    func engineCreation() async {
+      _ = await startup.withValue { $0.pending?.creation }?.value
     }
 
     /// Fetches pending remote changes from the server.
@@ -630,8 +709,6 @@
       try await enqueueLocallyPendingChanges()
       try await settleUnconfirmedDeletions()
       try await userDatabase.write { db in
-        try PendingRecordZoneChange.delete().execute(db)
-
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -644,13 +721,37 @@
       }
     }
 
+    /// Queues the changes saved while sync wasn't running, from the notes `noteForNextStart`
+    /// left.
+    ///
+    /// The notes are read, queued and removed in one write. A note is written in a write too, which
+    /// queues the change itself when sync is running, so each change is queued once: by the start
+    /// that reads its note, or directly. A change noted after this write waits for the next start.
     private func enqueueLocallyPendingChanges() async throws {
-      let pendingRecordZoneChanges = try await metadatabase.read { db in
-        try PendingRecordZoneChange
+      try await userDatabase.write { db in
+        let pendingRecordZoneChanges =
+          try PendingRecordZoneChange
           .select(\.pendingRecordZoneChange)
           .fetchAll(db)
+        guard !pendingRecordZoneChanges.isEmpty
+        else { return }
+        // NB: When sync stopped since this start began, the notes wait for the next start.
+        guard queueWithRunningEngines(pendingRecordZoneChanges)
+        else { return }
+        try PendingRecordZoneChange.delete().execute(db)
       }
-      let changesByIsPrivate = Dictionary(grouping: pendingRecordZoneChanges) {
+    }
+
+    /// Queues changes with the running sync engines, each one with the engine of its record's
+    /// database.
+    ///
+    /// - Returns: Whether sync is running. When it isn't, nothing is queued.
+    private func queueWithRunningEngines(
+      _ changes: [CKSyncEngine.PendingRecordZoneChange]
+    ) -> Bool {
+      guard let (privateSyncEngine, sharedSyncEngine) = runningSyncEngines()
+      else { return false }
+      let changesByIsPrivate = Dictionary(grouping: changes) {
         switch $0 {
         case .deleteRecord(let recordID), .saveRecord(let recordID):
           recordID.zoneID.ownerName == CKCurrentUserDefaultName
@@ -658,9 +759,51 @@
           false
         }
       }
-      syncEngines.withValue {
-        $0.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
-        $0.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+      if let changes = changesByIsPrivate[true] {
+        privateSyncEngine.state.add(pendingRecordZoneChanges: changes)
+      }
+      if let changes = changesByIsPrivate[false] {
+        sharedSyncEngine.state.add(pendingRecordZoneChanges: changes)
+      }
+      return true
+    }
+
+    /// The running sync engines, or nil when sync isn't running.
+    ///
+    /// They are taken under the lock of `syncEngines`, and their state is then read and changed
+    /// outside of it. With a large queue, `CKSyncEngine` can take hundreds of milliseconds over its
+    /// state (it saves the whole queue every time it changes: about 400 ms for 40 MB in the
+    /// simulator), and `isRunning`, which the main thread reads, takes that lock.
+    private func runningSyncEngines() -> (
+      private: any SyncEngineProtocol, shared: any SyncEngineProtocol
+    )? {
+      syncEngines.withValue { syncEngines in
+        guard syncEngines.isRunning,
+          let privateSyncEngine = syncEngines.private,
+          let sharedSyncEngine = syncEngines.shared
+        else { return nil }
+        return (privateSyncEngine, sharedSyncEngine)
+      }
+    }
+
+    /// Notes changes saved while sync isn't running, for the next start to queue.
+    ///
+    /// The note is written after the write that saved the changes, which a trigger can't do, on a
+    /// task. Sync may have started in the meantime, and its start may have read the notes already
+    /// (see `enqueueLocallyPendingChanges`). So the write checks again, and queues the changes
+    /// directly once sync is running.
+    private func noteForNextStart(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      // TODO: Perform this work in a trigger instead of a task.
+      Task {
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await userDatabase.write { db in
+            guard !queueWithRunningEngines(changes)
+            else { return }
+            try PendingRecordZoneChange
+              .insert { changes.map { PendingRecordZoneChange($0) } }
+              .execute(db)
+          }
+        }
       }
     }
 
@@ -753,13 +896,13 @@
       guard !returnedRows.isEmpty
       else { return }
 
-      syncEngines.withValue { syncEngines in
+      if let syncEngines = runningSyncEngines() {
         for returnedRow in returnedRows {
           let syncEngine =
             returnedRow.recordID.zoneID.ownerName == CKCurrentUserDefaultName
             ? syncEngines.private
             : syncEngines.shared
-          syncEngine?.state.remove(
+          syncEngine.state.remove(
             pendingRecordZoneChanges: returnedRow.deletionRecordIDs.map { .deleteRecord($0) }
           )
         }
@@ -773,10 +916,10 @@
         await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
       }
 
-      syncEngines.withValue { syncEngines in
+      if let syncEngines = runningSyncEngines() {
         for returnedRow in returnedRows where returnedRow.isChanged {
           let syncEngine = returnedRow.isPrivate ? syncEngines.private : syncEngines.shared
-          syncEngine?.state.add(pendingRecordZoneChanges: [.saveRecord(returnedRow.recordID)])
+          syncEngine.state.add(pendingRecordZoneChanges: [.saveRecord(returnedRow.recordID)])
         }
       }
     }
@@ -798,17 +941,16 @@
     ///   reached it.
     /// * When iCloud can't be reached, it waits for the next start.
     private func settleLostDeletions(recordNames: [String]) async throws {
-      let queuedDeletionRecordIDs = syncEngines.withValue { syncEngines in
-        Set(
-          ((syncEngines.private?.state.pendingRecordZoneChanges ?? [])
-            + (syncEngines.shared?.state.pendingRecordZoneChanges ?? []))
-            .compactMap { change -> CKRecord.ID? in
-              guard case .deleteRecord(let recordID) = change
-              else { return nil }
-              return recordID
-            }
-        )
-      }
+      let runningEngines = runningSyncEngines()
+      let queuedDeletionRecordIDs = Set(
+        ((runningEngines?.private.state.pendingRecordZoneChanges ?? [])
+          + (runningEngines?.shared.state.pendingRecordZoneChanges ?? []))
+          .compactMap { change -> CKRecord.ID? in
+            guard case .deleteRecord(let recordID) = change
+            else { return nil }
+            return recordID
+          }
+      )
       func lostDeletions() async throws -> [SyncMetadata] {
         try await metadatabase.read { db in
           try SyncMetadata
@@ -963,9 +1105,9 @@
             sharedChanges.append(contentsOf: changes)
           }
         }
-        syncEngines.withValue { [privateChanges, sharedChanges] in
-          $0.private?.state.add(pendingRecordZoneChanges: privateChanges)
-          $0.shared?.state.add(pendingRecordZoneChanges: sharedChanges)
+        if let syncEngines = runningSyncEngines() {
+          syncEngines.private.state.add(pendingRecordZoneChanges: privateChanges)
+          syncEngines.shared.state.add(pendingRecordZoneChanges: sharedChanges)
         }
       }
 
@@ -1182,31 +1324,9 @@
         )
       }
 
-      guard isRunning else {
-        // TODO: Perform this work in a trigger instead of a task.
-        Task { [changes = oldChanges + newChanges] in
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert {
-                  for change in changes {
-                    PendingRecordZoneChange(change)
-                  }
-                }
-                .execute(db)
-            }
-          }
-        }
-        return
-      }
-      let oldSyncEngine = self.syncEngines.withValue {
-        oldZoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      oldSyncEngine?.state.add(pendingRecordZoneChanges: oldChanges)
-      syncEngine?.state.add(pendingRecordZoneChanges: newChanges)
+      guard !queueWithRunningEngines(oldChanges + newChanges)
+      else { return }
+      noteForNextStart(oldChanges + newChanges)
     }
 
     @DatabaseFunction(
@@ -1227,23 +1347,9 @@
       if let share {
         changes.append(.deleteRecord(share.recordID))
       }
-      guard isRunning else {
-        Task { [changes] in
-          await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert { changes.map { PendingRecordZoneChange($0) } }
-                .execute(db)
-            }
-          }
-        }
-        return
-      }
-
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      syncEngine?.state.add(pendingRecordZoneChanges: changes)
+      guard !queueWithRunningEngines(changes)
+      else { return }
+      noteForNextStart(changes)
     }
 
     package func acceptShare(metadata: ShareMetadata) async throws {
@@ -1254,6 +1360,7 @@
       }
       let container = type(of: container).createContainer(identifier: metadata.containerIdentifier)
       _ = try await container.accept(metadata)
+      await engineCreation()
       try await syncEngines.shared?.fetchChanges(
         CKSyncEngine.FetchChangesOptions(
           scope: .zoneIDs([rootRecordID.zoneID]),
@@ -1729,6 +1836,8 @@
       changeType: CKSyncEngine.Event.AccountChange.ChangeType,
       syncEngine: any SyncEngineProtocol
     ) async {
+      // NB: An engine can report the account as soon as it is created, before it is in place.
+      await engineCreation()
       guard syncEngine === syncEngines.private
       else { return }
 
@@ -2775,6 +2884,25 @@
           .contains(where: { $0.name == "mode" && $0.value == "memory" })
           == true
     }
+  }
+
+  /// The starts of a sync engine, while their sync engines are being created (see `start`).
+  private struct Startup {
+    /// Increased by every stop, so that a start creating sync engines when sync stops throws them
+    /// away.
+    var generation = 0
+    /// The latest start, until its sync engines are created.
+    var pending: PendingStart?
+  }
+
+  private struct PendingStart {
+    /// The value of ``Startup/generation`` when the start began.
+    let generation: Int
+    /// Creates the sync engines and puts them in place, unless a stop called the start off.
+    /// Returns whether it put them in place.
+    let creation: Task<Bool, Never>
+    /// The creation of the sync engines, then the work of the start.
+    let task: Task<Void, Never>
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)

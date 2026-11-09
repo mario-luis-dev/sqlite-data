@@ -21,6 +21,8 @@
   )
   class BaseCloudKitTests: @unchecked Sendable {
     let userDatabase: UserDatabase
+    /// Holds back the creation of the sync engines when a test closes it.
+    let engineBuildGate = EngineBuildGate()
     private let _syncEngine: any Sendable
     private let _container: any Sendable
 
@@ -83,7 +85,8 @@
         ModelC.self,
         ScopedModel.self,
         privateTables: RemindersListPrivate.self,
-        startImmediately: startImmediately
+        startImmediately: startImmediately,
+        engineBuildGate: engineBuildGate
       )
       if startImmediately, accountStatus == .available {
         await syncEngine.handleEvent(
@@ -175,7 +178,8 @@
       delegate: (any SyncEngineDelegate)? = nil,
       tables: repeat (each T1).Type,
       privateTables: repeat (each T2).Type,
-      startImmediately: Bool = true
+      startImmediately: Bool = true,
+      engineBuildGate: EngineBuildGate? = nil
     ) async throws
     where
       repeat (each T1).PrimaryKey.QueryOutput: IdentifierStringConvertible,
@@ -197,7 +201,8 @@
         delegate: delegate,
         tables: allTables,
         privateTables: allPrivateTables,
-        startImmediately: startImmediately
+        startImmediately: startImmediately,
+        engineBuildGate: engineBuildGate
       )
     }
     convenience init(
@@ -206,18 +211,22 @@
       delegate: (any SyncEngineDelegate)? = nil,
       tables: [any SynchronizableTable],
       privateTables: [any SynchronizableTable] = [],
-      startImmediately: Bool = true
+      startImmediately: Bool = true,
+      engineBuildGate: EngineBuildGate? = nil
     ) async throws {
       try self.init(
         container: container,
         defaultZone: Self.defaultTestZone,
         defaultSyncEngines: { _, syncEngine in
-          (
-            MockSyncEngine(
-              database: container.privateCloudDatabase as! MockCloudDatabase,
-              parentSyncEngine: syncEngine,
-              state: MockSyncEngineState()
-            ),
+          engineBuildGate?.pass()
+          let privateSyncEngine = MockSyncEngine(
+            database: container.privateCloudDatabase as! MockCloudDatabase,
+            parentSyncEngine: syncEngine,
+            state: MockSyncEngineState()
+          )
+          engineBuildGate?.privateEngineCreated(privateSyncEngine)
+          return (
+            privateSyncEngine,
             MockSyncEngine(
               database: container.sharedCloudDatabase as! MockCloudDatabase,
               parentSyncEngine: syncEngine,

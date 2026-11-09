@@ -144,6 +144,9 @@
     package let _pendingDatabaseChanges = LockIsolated<
       OrderedSet<CKSyncEngine.PendingDatabaseChange>
     >([])
+    /// Runs before record zone changes are added, so that a test can make adding them take long,
+    /// as it does in `CKSyncEngine` with a large queue.
+    package let beforeAddingRecordZoneChanges = LockIsolated<(@Sendable () -> Void)?>(nil)
     private let fileID: StaticString
     private let filePath: StaticString
     private let line: UInt
@@ -175,6 +178,7 @@
     }
 
     package func add(pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange]) {
+      beforeAddingRecordZoneChanges.value?()
       // NB: Like CKSyncEngine, which keeps only the last of a save and a deletion of the same
       //     record: "If you add a [save] for recordA then [a delete], the sync engine discards the
       //     save and sends only the delete change", and the other way around
