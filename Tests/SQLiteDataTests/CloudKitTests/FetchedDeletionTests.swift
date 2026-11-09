@@ -11,12 +11,14 @@
   extension BaseCloudKitTests {
     /// Records under a record another device deleted, which this device added there.
     ///
-    /// The device that deletes a record sends the deletions of what it has under it. What another
-    /// device added under it, and the deleting device never fetched, stays on the server: CloudKit
-    /// deletes a parent even while other records point at it (`CKRecord.ReferenceAction.none`).
-    /// When this device fetches the deletion, SQLite deletes those rows here too, or clears their
-    /// reference, and the server must follow: otherwise the records stay there pointing at
-    /// nothing, and every device that fetches them waits for their parent for good.
+    /// The device that deletes a record sends the deletions of what it has under it. A link
+    /// another device added under it, and the deleting device never fetched, stays on the server:
+    /// a link points at its rows only through plain values, which CloudKit can't check. When this
+    /// device fetches the deletion, SQLite deletes those rows here too, or clears their reference,
+    /// and the server must follow: otherwise the records stay there pointing at nothing, and every
+    /// device that fetches them waits for their parent for good. CloudKit refuses to delete a
+    /// record while another one points at it as its parent, so the tests with a reminder under a
+    /// list leave it there with `deleteRecordsLeavingChildren`.
     @MainActor
     final class FetchedDeletionTests: BaseCloudKitTests, @unchecked Sendable {
       // * Local client creates a list, and it is sent.
@@ -59,6 +61,59 @@
 
         #expect(serverRecordNames() == [])
         #expect(try await metadataRecordNames() == [])
+      }
+
+      // * Local client creates a list with a reminder and a tag, and they are sent.
+      // * Local client tags the reminder, and the tagging is sent.
+      // * Another device, which never fetched the tagging, deletes the reminder. CloudKit lets it:
+      //   the tagging points at the reminder only through a plain value.
+      // * Local client fetches the deletion.
+      // => The tagging is deleted on this device and on the server, and nothing waits. The tag
+      //    stays.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func fetchedDeletionOfReminderDeletesTaggingAddedHere() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+            Tag(title: "home")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            ReminderTag(id: 1, reminderID: 1, tagID: "home")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        _ = try container.privateCloudDatabase.modifyRecords(
+          deleting: [Reminder.recordID(for: 1)]
+        )
+        try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
+
+        try await userDatabase.read { db in
+          try #expect(Reminder.all.fetchCount(db) == 0)
+          try #expect(ReminderTag.all.fetchCount(db) == 0)
+          try #expect(Tag.all.fetchCount(db) == 1)
+        }
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .deleteRecord(ReminderTag.recordID(for: 1))
+          ]
+        )
+        #expect(try await unsyncedRecordNames() == [])
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(
+          serverRecordNames() == [RemindersList.recordName(for: 1), Tag.recordName(for: "home")]
+        )
+        #expect(
+          try await metadataRecordNames() == [
+            RemindersList.recordName(for: 1), Tag.recordName(for: "home"),
+          ]
+        )
       }
 
       // * Local client creates a list with a reminder, and both are sent.

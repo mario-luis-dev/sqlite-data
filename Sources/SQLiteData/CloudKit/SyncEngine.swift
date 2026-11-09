@@ -1111,9 +1111,10 @@
     ///
     /// * Its records still on the server are deleted again, edited elsewhere or not.
     /// * The records another device added under them go too. They wait on this device for their
-    ///   missing parent (see `upsertFromServerRecord`), and would otherwise stay on the server,
-    ///   pointing at nothing, on every device: CloudKit deletes a parent even while other records
-    ///   point at it.
+    ///   missing parent (see `upsertFromServerRecord`). CloudKit refuses to delete a record while
+    ///   another one points at it as its parent ("Record delete would violate validating
+    ///   reference"), and a link, which points at its rows only through plain values, would
+    ///   otherwise stay on the server, pointing at nothing, on every device.
     /// * A record no longer on the server needs nothing more, and neither does one that never
     ///   reached it.
     /// * When iCloud can't be reached, it waits for the next start.
@@ -1352,8 +1353,11 @@
     ///
     /// A waiting record is only known to be one when it has a parent reference: CloudKit refuses
     /// to save a record whose parent isn't on the server (or in the same save), so a parent that
-    /// is missing now was there when the record was saved, and has been deleted since. Everything
-    /// else waits, as before:
+    /// is missing now was there when the record was saved, and has been deleted since. CloudKit
+    /// also refuses to delete a record while another one points at it as its parent (seen on
+    /// iCloud on 2026-11-09: "Record delete would violate validating reference"), so such a
+    /// record rarely outlives its parent, and this finds few if any. The usual leftovers are links,
+    /// which have no parent reference. Everything else waits, as before:
     ///
     /// * A record without a parent reference (one with several foreign keys) can wait for a row
     ///   that never reached the server: CloudKit saves it without checking, and a device keeps a
@@ -2190,8 +2194,8 @@
       else { return [] }
 
       // NB: A record whose row is on this device is never deleted on the server, and neither is
-      //     the share of a root whose row is: CloudKit deletes a parent even while other records
-      //     point at it, and every other device would then delete the row and everything under it.
+      //     the share of a root whose row is: every other device would then delete the row and
+      //     everything under it.
       //     Such a deletion comes from a queue older than the row's return (the saved state of an
       //     older version, restored before 'settleReturnedRows' runs), so it leaves the queue
       //     unsent; that start deletes the row and queues the deletion again.

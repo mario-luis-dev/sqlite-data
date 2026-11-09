@@ -120,8 +120,7 @@
       // => The new list is sent as an edit of the old one, as when it is created again before
       //    the deletion is sent while the engine runs
       //    (`PendingDeletionTests.rowCreatedAgainBeforeDeletionIsSentReplacesTheDeletion`). The
-      //    server record is never deleted: CloudKit would delete it while other records may still
-      //    point at it.
+      //    server record is never deleted: every other device would then delete its list.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func rowCreatedAgainWhileStoppedIsUploadedInPlace() async throws {
         try await userDatabase.userWrite { db in
@@ -427,9 +426,8 @@
       // * Local client deletes the list.
       // * Another device adds a reminder to the list. This device hasn't fetched it.
       // * The engine restarts without the deletion in its queue.
-      // => The deletion is sent, and the reminder goes with it: CloudKit would delete the list
-      //    while the reminder points at it, and the reminder would stay on the server, pointing at
-      //    nothing, waiting on every device for a list that never comes.
+      // => The deletion is sent, and the reminder goes with it: CloudKit refuses to delete the
+      //    list while the reminder points at it as its parent.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func lostDeletionOfParentWithChildAddedElsewhereDeletesTheChild() async throws {
         try await userDatabase.userWrite { db in

@@ -132,10 +132,11 @@
       }
     }
 
-    /// Deletes records the way CloudKit does, even while other records point at them as their
-    /// parent (`CKRecord.ReferenceAction.none`), which `modifyRecords` refuses. Those records stay,
-    /// pointing at nothing, as they do when a device deletes a record without the ones another
-    /// device added under it.
+    /// Deletes records even while other records point at them as their parent. CloudKit refuses
+    /// that ("Record delete would violate validating reference"), as `modifyRecords` does, but a
+    /// link, which points at its rows only through plain values, is left the same way when what
+    /// it points at is deleted: on the server, pointing at nothing. Tests use this to put records
+    /// with a parent reference in that state.
     package func deleteRecordsLeavingChildren(_ recordIDs: [CKRecord.ID]) {
       state.withValue { state in
         for recordID in recordIDs {

@@ -14,7 +14,9 @@
     /// Before a fetched deletion sent the deletions of what the device had under the deleted
     /// record (`FetchedDeletionTests`), those records stayed on the server, pointing at nothing,
     /// and every device that fetches them waits for their parent for good. A start deletes the
-    /// ones known to be under a deleted record, and only those.
+    /// ones known to be under a deleted record, and only those. CloudKit refuses to delete a
+    /// record while another one points at it as its parent, so these tests leave such records
+    /// with `deleteRecordsLeavingChildren`.
     @MainActor
     final class LeftoverRecordTests: BaseCloudKitTests, @unchecked Sendable {
       // * Another device creates a list with a reminder.
