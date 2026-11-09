@@ -6,10 +6,13 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package final class MockCloudDatabase: CloudDatabase {
-    package let state = LockIsolated(State())
+    package let state: LockIsolated<State>
     package let databaseScope: CKDatabase.Scope
     let _container = IsolatedWeakVar<MockCloudContainer>()
     let dataManager = Dependency(\.dataManager)
+    let now = Dependency(\.currentTime.now)
+    let uuid = Dependency(\.uuid)
+    let clock: AnyClock<Duration>
 
     package struct State {
       private var lastRecordChangeTag = 0
@@ -21,9 +24,23 @@
       package var deletionLog: [CKRecord.ID] = []
       /// An error that `records(for:desiredKeys:)` throws, as when the device can't reach iCloud.
       package var recordsLookupError: CKError?
+      package var quota: Int
+      package var rateLimit: Int
+      package var rateLimitDuration: Duration
+      fileprivate var requestTimestamps: [AnyClock<Duration>.Instant] = []
+      package var fetchedRecordIDs: [CKRecord.ID] = []
       mutating func nextRecordChangeTag() -> Int {
         lastRecordChangeTag += 1
         return lastRecordChangeTag
+      }
+      init(
+        quota: Int = .max,
+        rateLimit: Int,
+        rateLimitDuration: Duration
+      ) {
+        self.quota = quota
+        self.rateLimit = rateLimit
+        self.rateLimitDuration = rateLimitDuration
       }
     }
 
@@ -37,8 +54,22 @@
       package var records: [CKRecord.ID: CKRecord] = [:]
     }
 
-    package init(databaseScope: CKDatabase.Scope) {
+    package init(
+      databaseScope: CKDatabase.Scope,
+      quota: Int = .max,
+      rateLimit: Int = .max,
+      rateLimitDuration: Duration = .seconds(1)
+    ) {
       self.databaseScope = databaseScope
+      @Dependency(\.cloudKitClock) var clock
+      self.clock = AnyClock(clock)
+      self.state = LockIsolated(
+        State(
+          quota: quota,
+          rateLimit: rateLimit,
+          rateLimitDuration: rateLimitDuration
+        )
+      )
     }
 
     package func set(container: MockCloudContainer) {
@@ -50,29 +81,10 @@
     }
 
     package func record(for recordID: CKRecord.ID) throws -> CKRecord {
-      let accountStatus = container.accountStatus()
-      guard accountStatus == .available
-      else { throw ckError(forAccountStatus: accountStatus) }
-      let record = try state.withValue { state in
-        guard let zone = state.storage[recordID.zoneID]
-        else { throw CKError(.zoneNotFound) }
-        guard let record = zone.records[recordID]
-        else { throw CKError(.unknownItem) }
-        guard let record = record.copy() as? CKRecord
-        else { fatalError("Could not copy CKRecord.") }
-        return record
+      guard let record = try records(for: [recordID], desiredKeys: nil).values.first?.get()
+      else {
+        throw CKError(.unknownItem)
       }
-
-      try state.withValue { state in
-        for key in record.allKeys() {
-          guard let assetData = state.assets[AssetID(recordID: record.recordID, key: key)]
-          else { continue }
-          let url = dataManager.wrappedValue.temporaryDirectory.appending(path: UUID().uuidString)
-          try dataManager.wrappedValue.save(assetData, to: url)
-          record[key] = CKAsset(fileURL: url)
-        }
-      }
-
       return record
     }
 
@@ -83,7 +95,7 @@
       let accountStatus = container.accountStatus()
       guard accountStatus == .available
       else { throw ckError(forAccountStatus: accountStatus) }
-
+      try updateRateLimit()
       guard ids.count < 200
       else { throw CKError(.limitExceeded) }
 
@@ -91,11 +103,33 @@
         throw error
       }
 
-      var results: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
-      for id in ids {
-        results[id] = Result { try record(for: id) }
+      return state.withValue { state in
+        var result: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
+        for recordID in ids {
+          result[recordID] = Result {
+            guard let zone = state.storage[recordID.zoneID]
+            else { throw CKError(.zoneNotFound) }
+            guard let record = zone.records[recordID]
+            else { throw CKError(.unknownItem) }
+            guard let record = record.copy() as? CKRecord
+            else { fatalError("Could not copy CKRecord.") }
+
+            for key in record.allKeys() {
+              guard let assetData = state.assets[AssetID(recordID: record.recordID, key: key)]
+              else { continue }
+              let url = dataManager.wrappedValue.temporaryDirectory.appending(
+                path: uuid.wrappedValue().uuidString
+              )
+              try dataManager.wrappedValue.save(assetData, to: url)
+              record[key] = CKAsset(fileURL: url)
+            }
+
+            state.fetchedRecordIDs.append(recordID)
+            return record
+          }
+        }
+        return result
       }
-      return results
     }
 
     /// Deletes records the way CloudKit does, even while other records point at them as their
@@ -126,6 +160,7 @@
       let accountStatus = container.accountStatus()
       guard accountStatus == .available
       else { throw ckError(forAccountStatus: accountStatus) }
+      try updateRateLimit()
 
       guard (recordsToSave.count + recordIDsToDelete.count) < 200
       else {
@@ -215,6 +250,9 @@
 
               guard let databaseCopy = recordToSave.copy() as? CKRecord
               else { fatalError("Could not copy CKRecord.") }
+              databaseCopy._modificationDate = Date(
+                timeIntervalSinceReferenceDate: Double(now.wrappedValue)
+              )
               databaseCopy._recordChangeTag = state.nextRecordChangeTag()
 
               for key in databaseCopy.allKeys() {
@@ -240,6 +278,9 @@
                   as? CKRecord
               {
                 parentRecord._recordChangeTag = state.nextRecordChangeTag()
+                parentRecord._modificationDate = Date(
+                  timeIntervalSinceReferenceDate: Double(now.wrappedValue)
+                )
                 state.storage[parent.recordID.zoneID]?.records[parent.recordID] = parentRecord
               }
             }
@@ -345,6 +386,20 @@
           }
         }
 
+        // Emulate quotas by reverting all saves if the total number of records stored exceeds
+        // the quota.
+        guard state.storage.totalRecords <= state.quota
+        else {
+          state.storage = previousStorage
+          for saveSuccessRecordID in saveResults.keys {
+            saveResults[saveSuccessRecordID] = .failure(CKError(.quotaExceeded))
+          }
+          for deleteSuccessRecordID in deleteResults.keys {
+            state.storage[deleteSuccessRecordID.zoneID]?.records[deleteSuccessRecordID] = nil
+          }
+          return (saveResults: saveResults, deleteResults: deleteResults)
+        }
+
         guard atomically
         else {
           return (saveResults: saveResults, deleteResults: deleteResults)
@@ -394,6 +449,7 @@
       let accountStatus = container.accountStatus()
       guard accountStatus == .available
       else { throw ckError(forAccountStatus: accountStatus) }
+      try updateRateLimit()
 
       return state.withValue { state in
         var saveResults: [CKRecordZone.ID: Result<CKRecordZone, any Error>] = [:]
@@ -419,6 +475,26 @@
       }
     }
 
+    private func updateRateLimit() throws {
+      guard !_isRateLimitingDisabled else { return }
+      try state.withValue { state in
+        guard state.rateLimit != .max
+        else { return }
+        let now = clock.now
+        state.requestTimestamps.removeAll { $0.duration(to: now) >= state.rateLimitDuration }
+        let isRateLimited = state.requestTimestamps.count >= state.rateLimit
+        state.requestTimestamps.append(now)
+        guard !isRateLimited
+        else {
+          let (seconds, _) = state.rateLimitDuration.components
+          throw CKError(
+            .requestRateLimited,
+            userInfo: [CKErrorRetryAfterKey: Double(seconds)]
+          )
+        }
+      }
+    }
+
     package nonisolated static func == (lhs: MockCloudDatabase, rhs: MockCloudDatabase) -> Bool {
       lhs === rhs
     }
@@ -427,6 +503,8 @@
       hasher.combine(ObjectIdentifier(self))
     }
   }
+
+  @TaskLocal package var _isRateLimitingDisabled = false
 
   @available(macOS 13, iOS 16, tvOS 16, watchOS 9, *)
   private func ckError(forAccountStatus accountStatus: CKAccountStatus) -> CKError {
@@ -439,6 +517,15 @@
       fatalError()
     @unknown default:
       fatalError()
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  extension [CKRecordZone.ID: MockCloudDatabase.Zone] {
+    fileprivate var totalRecords: Int {
+      values.reduce(into: 0) { total, zone in
+        total += zone.records.count
+      }
     }
   }
 #endif

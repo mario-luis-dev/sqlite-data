@@ -262,7 +262,7 @@
       // => The report is handled once the engines are in place: it isn't dropped for coming from an
       //    engine that wasn't in place yet.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test(.taskLocal($syncEngineDelegate, MyDelegate()))
+      @Test(.taskLocal($syncEngineDelegate, AccountChangedDelegate()))
       func accountReportedWhileEnginesAreCreatedIsHandled() async throws {
         engineBuildGate.closeAfterPrivateEngine()
         let start = Task { [syncEngine] in try await syncEngine.start() }
@@ -279,7 +279,7 @@
         engineBuildGate.open()
         try await start.value
         try await accountReport.task.value
-        let delegate = try #require(syncEngineDelegate as? MyDelegate)
+        let delegate = try #require(syncEngineDelegate as? AccountChangedDelegate)
         #expect(delegate.wasCalled.value, "The account report was dropped")
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
       }

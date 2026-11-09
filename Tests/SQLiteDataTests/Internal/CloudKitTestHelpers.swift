@@ -34,10 +34,12 @@ extension SyncEngine {
   ) throws -> ModifyRecordsCallback {
     let syncEngine = syncEngine(for: scope)
 
-    let (saveResults, deleteResults) = try syncEngine.database.modifyRecordZones(
-      saving: recordZonesToSave,
-      deleting: recordZoneIDsToDelete
-    )
+    let (saveResults, deleteResults) = try $_isRateLimitingDisabled.withValue(true) {
+      try syncEngine.database.modifyRecordZones(
+        saving: recordZonesToSave,
+        deleting: recordZoneIDsToDelete
+      )
+    }
 
     return ModifyRecordsCallback {
       await syncEngine.parentSyncEngine
@@ -72,11 +74,13 @@ extension SyncEngine {
     )
     .compactMapValues(\.first)
 
-    let (saveResults, deleteResults) = try syncEngine.database.modifyRecords(
-      saving: recordsToSave,
-      deleting: recordIDsToDelete,
-      atomically: atomically
-    )
+    let (saveResults, deleteResults) = try $_isRateLimitingDisabled.withValue(true) {
+      try syncEngine.database.modifyRecords(
+        saving: recordsToSave,
+        deleting: recordIDsToDelete,
+        atomically: atomically
+      )
+    }
 
     return ModifyRecordsCallback {
       let savedRecordIDs = saveResults.compactMap { recordID, result in
@@ -86,10 +90,12 @@ extension SyncEngine {
         (try? result.get()) != nil ? recordID : nil
       }
       let freshRecords =
-        (try? syncEngine.database.records(
-          for: savedRecordIDs + deletedRecordIDs,
-          desiredKeys: nil
-        )) ?? [:]
+        (try? $_isRateLimitingDisabled.withValue(true) {
+          try syncEngine.database.records(
+            for: savedRecordIDs + deletedRecordIDs,
+            desiredKeys: nil
+          )
+        }) ?? [:]
       await syncEngine.parentSyncEngine.handleEvent(
         .fetchedRecordZoneChanges(
           modifications: savedRecordIDs.compactMap { recordID in
@@ -159,16 +165,16 @@ extension MockSyncEngineState {
     line: UInt = #line,
     column: UInt = #column
   ) {
-    _pendingRecordZoneChanges.withValue {
+    withState {
       expectNoDifference(
         Set(changes),
-        Set($0),
+        Set($0.pendingRecordZoneChanges),
         fileID: fileID,
         filePath: filePath,
         line: line,
         column: column
       )
-      $0.removeAll()
+      $0.pendingRecordZoneChanges.removeAll()
     }
   }
 
@@ -179,17 +185,16 @@ extension MockSyncEngineState {
     line: UInt = #line,
     column: UInt = #column
   ) {
-    _pendingDatabaseChanges.withValue {
+    withState {
       expectNoDifference(
         Set(changes),
-        Set($0),
+        Set($0.pendingDatabaseChanges),
         fileID: fileID,
         filePath: filePath,
         line: line,
         column: column
       )
-      $0.removeAll()
+      $0.pendingDatabaseChanges.removeAll()
     }
   }
-
 }

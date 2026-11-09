@@ -103,6 +103,15 @@
           )
           """
         }
+        // NB: The preview timer's sync can still be finishing its send here: the deletion is on the
+        //     server, but 'sendChanges' keeps 'hasPendingUntrackedChanges' set until it returns,
+        //     a millisecond or two later. The test ends once it has.
+        let start = ContinuousClock.now
+        while syncEngine.private.state.hasPendingUntrackedChanges,
+          ContinuousClock.now - start < .seconds(5)
+        {
+          try await Task.sleep(for: .milliseconds(1))
+        }
       }
     }
   }

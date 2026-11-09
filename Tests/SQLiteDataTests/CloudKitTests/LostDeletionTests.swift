@@ -317,7 +317,8 @@
                   recordID: CKRecord.ID(share-1:remindersLists/external.zone/external.owner),
                   recordType: "cloudkit.share",
                   parent: nil,
-                  share: nil
+                  share: nil,
+                  cloudkit.title: nil
                 ),
                 [1]: CKRecord(
                   recordID: CKRecord.ID(1:remindersLists/external.zone/external.owner),
