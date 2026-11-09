@@ -381,11 +381,10 @@
       // * Local client deletes the list.
       // * Another device renames the list. This device hasn't fetched the rename.
       // * The engine restarts without the deletion in its queue.
-      // => The deletion isn't sent: the list changed on another device after this device deleted
-      //    it, and deleting it now would throw that change away on every device. The list comes
-      //    back on this device, with the other device's title.
+      // => The deletion is sent all the same: the person deleted the list, and a deletion wins
+      //    over an edit made elsewhere. The list is gone on this device and on the server.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func lostDeletionOfRecordEditedElsewhereIsUndone() async throws {
+      @Test func lostDeletionOfRecordEditedElsewhereIsSent() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -406,27 +405,32 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .deleteRecord(RemindersList.recordID(for: 1))
+          ]
+        )
 
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
         try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Business")])
+          try #expect(RemindersList.all.fetchCount(db) == 0)
         }
-        #expect(serverRecordNames() == [RemindersList.recordName(for: 1)])
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(try await deletedRecordNames() == [])
+        #expect(try await metadataCount() == 0)
       }
 
       // * Local client creates a list, and it is sent.
       // * Local client deletes the list.
       // * Another device adds a reminder to the list. This device hasn't fetched it.
       // * The engine restarts without the deletion in its queue.
-      // => The deletion isn't sent: CloudKit would delete the list while the reminder points at
-      //    it, and the other device would then delete the reminder. The list comes back on this
-      //    device, with the reminder.
+      // => The deletion is sent, and the reminder goes with it: CloudKit would delete the list
+      //    while the reminder points at it, and the reminder would stay on the server, pointing at
+      //    nothing, waiting on every device for a list that never comes.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func lostDeletionOfParentWithChildAddedElsewhereIsUndone() async throws {
+      @Test func lostDeletionOfParentWithChildAddedElsewhereDeletesTheChild() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -455,29 +459,34 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .deleteRecord(RemindersList.recordID(for: 1)),
+            .deleteRecord(Reminder.recordID(for: 1)),
+          ]
+        )
+        #expect(try await unsyncedRecordNames() == [])
 
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
         try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
-          try #expect(Reminder.all.fetchCount(db) == 1)
+          try #expect(RemindersList.all.fetchCount(db) == 0)
+          try #expect(Reminder.all.fetchCount(db) == 0)
         }
-        #expect(
-          serverRecordNames() == [RemindersList.recordName(for: 1), Reminder.recordName(for: 1)]
-        )
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(try await deletedRecordNames() == [])
+        #expect(try await metadataCount() == 0)
+        #expect(try await unsyncedRecordNames() == [])
       }
 
       // * Local client creates a record with a child, and both are sent.
       // * Local client deletes the record, which deletes the child too.
       // * Another device adds a grandchild under the child. This device hasn't fetched it.
       // * The engine restarts without the deletions in its queue.
-      // => Neither deletion is sent, and the record, its child and the new grandchild are all on
-      //    this device.
+      // => Both deletions are sent, and the grandchild goes with them.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func lostDeletionOfTreeWithGrandchildAddedElsewhereIsUndone() async throws {
+      @Test func lostDeletionOfTreeWithGrandchildAddedElsewhereDeletesTheGrandchild() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             ModelA.Draft(id: 1)
@@ -503,17 +512,25 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .deleteRecord(ModelA.recordID(for: 1)),
+            .deleteRecord(ModelB.recordID(for: 1)),
+            .deleteRecord(ModelC.recordID(for: 1)),
+          ]
+        )
 
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
         try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         try await userDatabase.read { db in
-          try #expect(ModelA.all.fetchCount(db) == 1)
-          try #expect(ModelB.all.fetchCount(db) == 1)
-          try #expect(ModelC.all.fetchAll(db) == [ModelC(id: 1, title: "Note", modelBID: 1)])
+          try #expect(ModelA.all.fetchCount(db) == 0)
+          try #expect(ModelB.all.fetchCount(db) == 0)
+          try #expect(ModelC.all.fetchCount(db) == 0)
         }
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(try await deletedRecordNames() == [])
+        #expect(try await unsyncedRecordNames() == [])
       }
 
       // * Local client creates a record with two children and a grandchild under the first one,
@@ -521,11 +538,9 @@
       // * Local client deletes the record, which deletes everything under it.
       // * Another device edits the grandchild. This device hasn't fetched the edit.
       // * The engine restarts without the deletions in its queue.
-      // => None of the deletions is sent, and the whole tree comes back on this device, with the
-      //    edit: the deletion of the record is undone as a whole, rather than leaving the parts
-      //    that nobody touched deleted.
+      // => Every deletion is sent: the edit below the record doesn't bring any of it back.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func lostDeletionOfTreeEditedBelowItsRootIsUndoneWhole() async throws {
+      @Test func lostDeletionOfTreeEditedBelowItsRootIsSentWhole() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             ModelA.Draft(id: 1)
@@ -547,16 +562,24 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .deleteRecord(ModelA.recordID(for: 1)),
+            .deleteRecord(ModelB.recordID(for: 1)),
+            .deleteRecord(ModelB.recordID(for: 2)),
+            .deleteRecord(ModelC.recordID(for: 1)),
+          ]
+        )
 
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
         try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         try await userDatabase.read { db in
-          try #expect(ModelA.all.fetchCount(db) == 1)
-          try #expect(ModelB.all.fetchCount(db) == 2)
-          try #expect(ModelC.all.fetchAll(db) == [ModelC(id: 1, title: "Edited", modelBID: 1)])
+          try #expect(ModelA.all.fetchCount(db) == 0)
+          try #expect(ModelB.all.fetchCount(db) == 0)
+          try #expect(ModelC.all.fetchCount(db) == 0)
         }
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(try await deletedRecordNames() == [])
       }
 
@@ -643,10 +666,9 @@
       // * Local client deletes the reminder.
       // * The other user renames the reminder. This device hasn't fetched the rename.
       // * The engine restarts without the deletion in its queue.
-      // => The deletion isn't sent to the shared database, and the reminder comes back on this
-      //    device with the other user's title.
+      // => The deletion is sent to the shared database all the same, and the list stays.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func lostDeletionInSharedZoneOfRecordEditedElsewhereIsUndone() async throws {
+      @Test func lostDeletionInSharedZoneOfRecordEditedElsewhereIsSent() async throws {
         let externalZone = CKRecordZone(
           zoneID: CKRecordZone.ID(
             zoneName: "external.zone",
@@ -700,14 +722,21 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.shared.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          syncEngine.shared.state.pendingRecordZoneChanges == [
+            .deleteRecord(Reminder.recordID(for: 1, zoneID: externalZone.zoneID))
+          ]
+        )
 
+        try await syncEngine.processPendingRecordZoneChanges(scope: .shared)
         try await syncEngine.shared.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         try await userDatabase.read { db in
-          try #expect(Reminder.find(1).fetchOne(db)?.title == "Buy milk")
+          try #expect(Reminder.all.fetchCount(db) == 0)
+          try #expect(RemindersList.all.fetchCount(db) == 1)
         }
-        #expect(serverDeletions(.shared) == [])
+        #expect(!serverRecordNames(.shared).contains(Reminder.recordName(for: 1)))
+        #expect(serverRecordNames(.shared).contains(RemindersList.recordName(for: 1)))
         #expect(try await deletedRecordNames() == [])
       }
 
@@ -716,6 +745,14 @@
       private func metadataCount() async throws -> Int {
         try await syncEngine.metadatabase.read { db in
           try SyncMetadata.count().fetchOne(db) ?? 0
+        }
+      }
+
+      /// The record names waiting on this device for a parent that hasn't arrived.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      private func unsyncedRecordNames() async throws -> Set<String> {
+        try await syncEngine.metadatabase.read { db in
+          Set(try UnsyncedRecordID.all.fetchAll(db).map(\.recordName))
         }
       }
 

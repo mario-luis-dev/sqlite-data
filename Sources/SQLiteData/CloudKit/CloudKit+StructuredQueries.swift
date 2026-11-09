@@ -366,27 +366,6 @@
       return false
     }
 
-    /// Whether another version of this record holds the same fields, with the same modification
-    /// times.
-    ///
-    /// The record's overall modification time is left out: merging a fetched record raises it to
-    /// the time of the last local change, which says nothing about the fields themselves.
-    func hasSameFields(as other: CKRecord) -> Bool {
-      let keys = Set(encryptedValues.allKeys()).union(other.encryptedValues.allKeys())
-      return keys.allSatisfy { key in
-        guard key != Self.userModificationTimeKey
-        else { return true }
-        switch (encryptedValues[key], other.encryptedValues[key]) {
-        case (nil, nil):
-          return true
-        case (let value?, let otherValue?):
-          return (value as AnyObject).isEqual(otherValue as AnyObject)
-        default:
-          return false
-        }
-      }
-    }
-
     package var userModificationTime: Int64 {
       get { encryptedValues[Self.userModificationTimeKey] as? Int64 ?? -1 }
       set {

@@ -98,6 +98,22 @@
       return results
     }
 
+    /// Deletes records the way CloudKit does, even while other records point at them as their
+    /// parent (`CKRecord.ReferenceAction.none`), which `modifyRecords` refuses. Those records stay,
+    /// pointing at nothing, as they do when a device deletes a record without the ones another
+    /// device added under it.
+    package func deleteRecordsLeavingChildren(_ recordIDs: [CKRecord.ID]) {
+      state.withValue { state in
+        for recordID in recordIDs {
+          guard let record = state.storage[recordID.zoneID]?.records[recordID]
+          else { continue }
+          state.storage[recordID.zoneID]?.records[recordID] = nil
+          state.deletedRecords.append((recordID, record.recordType))
+          state.deletionLog.append(recordID)
+        }
+      }
+    }
+
     package func modifyRecords(
       saving recordsToSave: [CKRecord] = [],
       deleting recordIDsToDelete: [CKRecord.ID] = [],

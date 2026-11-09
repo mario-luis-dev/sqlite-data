@@ -18,18 +18,18 @@
     /// library, where it has been ever since. Re-creating a row with the same primary key before
     /// its deletion was sent left the same state.
     ///
-    /// Such a row must never be deleted on the server. CloudKit deletes a parent record even when
-    /// other records still point at it (`CKRecord.ReferenceAction.none`), and every other device
-    /// then deletes the row and everything under it, while their own copies of the children
-    /// never come back. Its flag must go too, or fetches keep skipping other devices' edits of it.
+    /// The person deleted such a row, so the next start deletes it again, with everything under
+    /// it, on the device and on the server. A row someone took back after it returned stays
+    /// instead: one holding a change the server never received, or with a row under it that the
+    /// deletion didn't take. Its flag goes, or fetches keep skipping other devices' edits of it.
     @MainActor
     final class ReturnedRowTests: BaseCloudKitTests, @unchecked Sendable {
       // * Local client creates a list with a reminder, and both are sent.
       // * An older version left both rows flagged as deleted while they are on the device.
       // * The engine starts.
-      // => Neither is deleted, and nothing is sent: both rows match the server. The flags go.
+      // => Both are deleted again, on this device and on the server: the person deleted them.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedRowsStayAndAreNotSentAgain() async throws {
+      @Test func returnedRowsAreDeletedAgain() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -45,25 +45,31 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
-        #expect(try await flaggedRecordNames() == [])
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
-          try #expect(Reminder.all.fetchCount(db) == 1)
+          try #expect(RemindersList.all.fetchCount(db) == 0)
+          try #expect(Reminder.all.fetchCount(db) == 0)
         }
         #expect(
-          serverRecordNames() == [RemindersList.recordName(for: 1), Reminder.recordName(for: 1)]
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .deleteRecord(RemindersList.recordID(for: 1)),
+            .deleteRecord(Reminder.recordID(for: 1)),
+          ]
         )
-        #expect(serverDeletions() == [])
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(serverRecordNames() == [])
+        #expect(try await flaggedRecordNames() == [])
+        #expect(try await metadataRecordNames() == [])
       }
 
       // * Local client creates a list, and it is sent.
       // * An older version left the list flagged as deleted while it is on the device.
       // * Local client adds a reminder to the list, and it is sent.
       // * The engine starts.
-      // => The list is not deleted. Real CloudKit would delete it while the reminder points at it,
-      //    and every other device would then delete the list and the reminder. The fake server
-      //    refuses that deletion instead, so the queue is what shows it.
+      // => The list stays, with the reminder: someone took the list back after it returned. The
+      //    deletion of the list took everything under it, so a row under it that isn't flagged
+      //    was added since.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func returnedParentWithNewChildIsNeverDeleted() async throws {
         try await userDatabase.userWrite { db in
@@ -86,6 +92,10 @@
 
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
         #expect(try await flaggedRecordNames() == [])
+        try await userDatabase.read { db in
+          try #expect(RemindersList.all.fetchCount(db) == 1)
+          try #expect(Reminder.all.fetchCount(db) == 1)
+        }
         #expect(
           serverRecordNames() == [RemindersList.recordName(for: 1), Reminder.recordName(for: 1)]
         )
@@ -94,10 +104,10 @@
 
       // * Local client creates a list, and it is sent.
       // * An older version left the list flagged as deleted while it is on the device.
-      // * The engine starts, and then another device renames the list.
-      // => The rename reaches this device.
+      // * The engine starts, and then another device renames the list before this device sends.
+      // => The rename doesn't bring the list back, and the deletion is sent.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedRowReceivesOtherDevicesEdits() async throws {
+      @Test func returnedRowDeletedAgainIsNotBroughtBackByOtherDevicesEdit() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -115,8 +125,11 @@
         try await syncEngine.modifyRecords(scope: .private, saving: [record]).notify()
 
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Business")])
+          try #expect(RemindersList.all.fetchCount(db) == 0)
         }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(serverRecordNames() == [])
         #expect(try await flaggedRecordNames() == [])
       }
 
@@ -124,10 +137,10 @@
       // * An older version left the list flagged as deleted while it is on the device.
       // * Another device renames the list, and this device fetches the rename before the engine
       //   restarts, which skips it because the row is flagged.
-      // * The engine starts. Its change token is past the rename, so no later fetch delivers it.
-      // => The rename reaches this device all the same, and nothing is deleted or sent.
+      // * The engine starts.
+      // => The list is deleted again all the same: a deletion wins over an edit made elsewhere.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedRowGetsEditFetchedBeforeStart() async throws {
+      @Test func returnedRowEditedElsewhereIsDeletedAgain() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -145,19 +158,24 @@
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Business")])
+          try #expect(RemindersList.all.fetchCount(db) == 0)
         }
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .deleteRecord(RemindersList.recordID(for: 1))
+          ]
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(serverRecordNames() == [])
         #expect(try await flaggedRecordNames() == [])
-        #expect(serverDeletions() == [])
       }
 
       // * Local client creates a list, and it is sent.
       // * An older version left the list flagged as deleted while it is on the device.
       // * Another device deletes the list. This device hasn't fetched that yet.
-      // * The engine starts, and then fetches the deletion.
-      // => The list is deleted on this device too, and nothing brings it back to the server: an
-      //    upload sent before the fetch would recreate a record another device deleted.
+      // * The engine starts, fetches the deletion, and sends.
+      // => The list is gone on this device and on the server, and nothing is left behind.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func returnedRowDeletedElsewhereIsNotBroughtBack() async throws {
         try await userDatabase.userWrite { db in
@@ -173,15 +191,15 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
-
         try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
 
         try await userDatabase.read { db in
           try #expect(RemindersList.all.fetchCount(db) == 0)
         }
         #expect(serverRecordNames() == [])
         #expect(try await metadataRecordNames() == [])
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
       }
 
       // * Local client creates a list, and it is sent.
@@ -281,9 +299,9 @@
       // * An older version left the list flagged as deleted while it is on the device, and its
       //   deletion is still in CKSyncEngine's queue: the saved state kept it.
       // * The engine starts and sends.
-      // => The deletion is not sent, and leaves the queue.
+      // => The list is deleted on this device, and the deletion is sent once.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func queuedDeletionOfReturnedRowIsNeverSent() async throws {
+      @Test func queuedDeletionOfReturnedRowIsSent() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -302,21 +320,21 @@
         )
         try await syncEngine.processPendingRecordZoneChanges(scope: .private)
 
-        #expect(serverRecordNames() == [RemindersList.recordName(for: 1)])
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
         try await userDatabase.read { db in
-          try #expect(RemindersList.all.fetchCount(db) == 1)
+          try #expect(RemindersList.all.fetchCount(db) == 0)
         }
+        #expect(try await metadataRecordNames() == [])
       }
 
       // * Local client shares a list with a reminder, and all of it is sent.
       // * An older version left the list and the reminder flagged as deleted while they are on
       //   the device, and their deletions, with the share's, are still in CKSyncEngine's queue.
       // * The engine starts and sends.
-      // => Nothing is deleted: the list stays shared, with its reminder.
+      // => The list, its reminder and its share are all deleted.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedSharedRootKeepsItsShare() async throws {
+      @Test func returnedSharedRootIsDeletedWithItsShare() async throws {
         let remindersList = RemindersList(id: 1, title: "Personal")
         try await userDatabase.userWrite { db in
           try db.seed {
@@ -334,16 +352,12 @@
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
 
-        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
-
         let shareRecordID = CKRecord.ID(
           recordName: "share-\(RemindersList.recordID(for: 1).recordName)",
           zoneID: syncEngine.defaultZone.zoneID
         )
-        // NB: The fakes start every engine from an empty state. This puts back the deletions a
-        //     saved state that kept them would hold.
-        syncEngine.private.state.add(
-          pendingRecordZoneChanges: [
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
             .deleteRecord(RemindersList.recordID(for: 1)),
             .deleteRecord(shareRecordID),
             .deleteRecord(Reminder.recordID(for: 1)),
@@ -351,25 +365,22 @@
         )
         try await syncEngine.processPendingRecordZoneChanges(scope: .private)
 
-        #expect(
-          serverRecordNames() == [
-            RemindersList.recordName(for: 1),
-            Reminder.recordName(for: 1),
-            shareRecordID.recordName,
-          ]
-        )
-        #expect(serverDeletions() == [])
+        #expect(serverRecordNames() == [])
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
         #expect(try await flaggedRecordNames() == [])
+        try await userDatabase.read { db in
+          try #expect(RemindersList.all.fetchCount(db) == 0)
+          try #expect(Reminder.all.fetchCount(db) == 0)
+        }
       }
 
       // * Local client creates a list, and it is sent.
       // * An older version left the list flagged as deleted while it is on the device.
-      // * The engine starts, and local client renames the list.
+      // * The engine starts, and sends.
       // * The engine restarts.
-      // => The rename is sent, and the restart queues nothing: the list is not deleted later.
+      // => The list is deleted once, and the restart neither queues anything nor brings it back.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedRowEditedLocallyIsUploadedAndNeverDeletedLater() async throws {
+      @Test func returnedRowDeletedAgainStaysDeletedAfterRestart() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -381,29 +392,21 @@
         syncEngine.stop()
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
-
-        try await userDatabase.userWrite { db in
-          try RemindersList.find(1).update { $0.title = "Groceries" }.execute(db)
-        }
-        #expect(
-          syncEngine.private.state.pendingRecordZoneChanges == [
-            .saveRecord(RemindersList.recordID(for: 1))
-          ]
-        )
         try await syncEngine.processPendingRecordZoneChanges(scope: .private)
 
-        #expect(
-          serverRecord(RemindersList.recordID(for: 1))?.encryptedValues["title"] as? String
-            == "Groceries"
-        )
-        #expect(try await flaggedRecordNames() == [])
+        #expect(serverRecordNames() == [])
+        #expect(try await metadataRecordNames() == [])
 
         syncEngine.stop()
         try await syncEngine.start()
         try await syncEngine.processPendingDatabaseChanges(scope: .private)
+        try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
 
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
-        #expect(serverDeletions() == [])
+        try await userDatabase.read { db in
+          try #expect(RemindersList.all.fetchCount(db) == 0)
+        }
+        #expect(serverRecordNames() == [])
       }
 
       // * Local client creates a list. The engine stops before the list is sent, and its queue
@@ -439,10 +442,10 @@
       // * An older version left both reminders flagged as deleted while they are on the device,
       //   and the second one with a title the server never received.
       // * The engine starts.
-      // => Nothing is deleted in the other user's zone. Only the second reminder is sent, to the
-      //    shared database, and the first one is left as it is.
+      // => The first reminder is deleted again, in the shared database. The second one stays,
+      //    since it holds a change made after it returned, which is sent to the shared database.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func returnedRowsInSharedZoneStay() async throws {
+      @Test func returnedRowsInSharedZoneAreSettled() async throws {
         let externalZone = CKRecordZone(
           zoneID: CKRecordZone.ID(
             zoneName: "external.zone",
@@ -497,8 +500,9 @@
 
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
         #expect(
-          syncEngine.shared.state.pendingRecordZoneChanges == [
-            .saveRecord(Reminder.recordID(for: 2, zoneID: externalZone.zoneID))
+          Set(syncEngine.shared.state.pendingRecordZoneChanges) == [
+            .deleteRecord(Reminder.recordID(for: 1, zoneID: externalZone.zoneID)),
+            .saveRecord(Reminder.recordID(for: 2, zoneID: externalZone.zoneID)),
           ]
         )
         try await syncEngine.processPendingRecordZoneChanges(scope: .shared)
@@ -510,13 +514,14 @@
         #expect(
           serverRecordNames(.shared) == [
             RemindersList.recordName(for: 1),
-            Reminder.recordName(for: 1),
             Reminder.recordName(for: 2),
             share.recordID.recordName,
           ]
         )
-        #expect(serverDeletions(.shared) == [])
         #expect(try await flaggedRecordNames() == [])
+        try await userDatabase.read { db in
+          try #expect(Reminder.all.fetchAll(db).map(\.id) == [2])
+        }
       }
     }
   }
