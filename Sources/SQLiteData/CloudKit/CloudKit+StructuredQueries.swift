@@ -307,31 +307,10 @@
             didSet = false
           }
           /// The row value has been modified more recently than the last known record.
-          var isRowValueModified: Bool {
-            switch Value(queryOutput: row[keyPath: keyPath]).queryBinding {
-            case .blob(let value):
-              return other.encryptedValues[hash: key] != value.sha256
-            case .bool(let value):
-              return other.encryptedValues[key] != value
-            case .double(let value):
-              return other.encryptedValues[key] != value
-            case .date(let value):
-              return other.encryptedValues[key] != value
-            case .int(let value):
-              return other.encryptedValues[key] != value
-            case .null:
-              return other.encryptedValues[key] != nil
-            case .text(let value):
-              return other.encryptedValues[key] != value
-            case .uint(let value):
-              return other.encryptedValues[key] != value
-            case .uuid(let value):
-              return other.encryptedValues[key] != value.uuidString.lowercased()
-            case .invalid(let error):
-              reportIssue(error)
-              return false
-            }
-          }
+          let isRowValueModified = other.holdsValue(
+            differentFrom: Value(queryOutput: row[keyPath: keyPath]).queryBinding,
+            forKey: key
+          )
           if didSet || isRowValueModified {
             columnNames.removeAll(where: { $0 == key })
             if didSet, let parentForeignKey, key == parentForeignKey.from {
@@ -340,6 +319,71 @@
           }
         }
         open(column)
+      }
+    }
+
+    /// Whether this record holds, for a key, a value other than a row's.
+    fileprivate func holdsValue(differentFrom binding: QueryBinding, forKey key: String) -> Bool {
+      switch binding {
+      case .blob(let value):
+        return encryptedValues[hash: key] != value.sha256
+      case .bool(let value):
+        return encryptedValues[key] != value
+      case .double(let value):
+        return encryptedValues[key] != value
+      case .date(let value):
+        return encryptedValues[key] != value
+      case .int(let value):
+        return encryptedValues[key] != value
+      case .null:
+        return encryptedValues[key] != nil
+      case .text(let value):
+        return encryptedValues[key] != value
+      case .uint(let value):
+        return encryptedValues[key] != value
+      case .uuid(let value):
+        return encryptedValues[key] != value.uuidString.lowercased()
+      case .invalid(let error):
+        reportIssue(error)
+        return false
+      }
+    }
+
+    /// Whether a row holds a value this record doesn't, in any of its columns.
+    func isModified<T: PrimaryKeyedTable>(by row: T) -> Bool {
+      for column in T.TableColumns.writableColumns {
+        func open<Root, Value>(_ column: some WritableTableColumnExpression<Root, Value>) -> Bool {
+          let keyPath = column.keyPath as! KeyPath<T, Value.QueryOutput>
+          return holdsValue(
+            differentFrom: Value(queryOutput: row[keyPath: keyPath]).queryBinding,
+            forKey: column.name
+          )
+        }
+        if open(column) {
+          return true
+        }
+      }
+      return false
+    }
+
+    /// Whether another version of this record holds the same fields, with the same modification
+    /// times.
+    ///
+    /// The record's overall modification time is left out: merging a fetched record raises it to
+    /// the time of the last local change, which says nothing about the fields themselves.
+    func hasSameFields(as other: CKRecord) -> Bool {
+      let keys = Set(encryptedValues.allKeys()).union(other.encryptedValues.allKeys())
+      return keys.allSatisfy { key in
+        guard key != Self.userModificationTimeKey
+        else { return true }
+        switch (encryptedValues[key], other.encryptedValues[key]) {
+        case (nil, nil):
+          return true
+        case (let value?, let otherValue?):
+          return (value as AnyObject).isEqual(otherValue as AnyObject)
+        default:
+          return false
+        }
       }
     }
 

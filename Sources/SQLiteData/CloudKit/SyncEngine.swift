@@ -628,7 +628,7 @@
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
       try await enqueueLocallyPendingChanges()
-      try await enqueueUnconfirmedDeletions()
+      try await settleUnconfirmedDeletions()
       try await userDatabase.write { db in
         try PendingRecordZoneChange.delete().execute(db)
 
@@ -664,23 +664,18 @@
       }
     }
 
-    /// Queues again the local deletions that CloudKit hasn't confirmed.
+    /// Settles the local deletions CloudKit hasn't confirmed, when the engine starts.
     ///
     /// A deletion keeps its metadata, flagged with `_isDeleted`, until it leaves the queue (see
-    /// `removeDeletionMetadata`), but the queue lives in CKSyncEngine's saved state, which can be
-    /// lost, or saved before the deletion was queued. A deletion missing from it is never sent:
-    /// the record stays on the server while the row is gone from the device, and a row created
-    /// again with the same primary key is never uploaded. CKSyncEngine deduplicates pending
-    /// changes, so a deletion that is still queued is unaffected.
+    /// `removeDeletionMetadata`). Two things can leave that metadata wrong: the row is back on the
+    /// device (see `keepReturnedRows`), or the deletion is missing from the queue, which lives in
+    /// CKSyncEngine's saved state and can be lost (see `settleLostDeletions`).
     ///
-    /// Called after the changes made while the engine was stopped are queued: the deletion queued
-    /// last wins over a save of the same record, and the row created again is uploaded once the
-    /// deletion is confirmed.
-    private func enqueueUnconfirmedDeletions() async throws {
+    /// Called after the changes made while the engine was stopped are queued, so that a deletion
+    /// queued then counts as queued.
+    private func settleUnconfirmedDeletions() async throws {
       // NB: No index covers '_isDeleted', so the deletions are found on a reader, where the scan
-      //     cannot hold up writes. They are queued in a write, which cannot interleave with the
-      //     confirmation of one of them: a deletion confirmed in the meantime has lost its flag,
-      //     and queueing it again would discard the upload of a row created again since.
+      //     cannot hold up writes. Each step checks the flag again in the write that acts on it.
       let recordNames = try await metadatabase.read { db in
         try SyncMetadata
           .where(\._isDeleted)
@@ -689,23 +684,277 @@
       }
       guard !recordNames.isEmpty
       else { return }
-      try await userDatabase.write { db in
-        let deletions =
+      try await keepReturnedRows(recordNames: recordNames)
+      try await settleLostDeletions(recordNames: recordNames)
+    }
+
+    /// Keeps the rows that are on the device although their metadata is flagged `_isDeleted`.
+    ///
+    /// Older versions left such rows behind: a fetch wrote a deleted row back when its deletion
+    /// hadn't been sent yet, and writing a row again with the same primary key left its flag on.
+    /// The row is what the person sees, so it stays. It must never be deleted on the server:
+    /// CloudKit deletes a parent record even while other records point at it
+    /// (`CKRecord.ReferenceAction.none`), and every other device would then delete the row and
+    /// everything under it.
+    ///
+    /// Its flag goes, and with it any deletion of it, or of its share, still queued. It is fetched
+    /// again, for the edits fetches skipped while it was flagged. It is uploaded only when it holds
+    /// a change the server never received: uploading a row that matches the server would recreate
+    /// its record if another device deleted it in the meantime.
+    private func keepReturnedRows(recordNames: [String]) async throws {
+      let returnedRows = try await userDatabase.write { db in
+        var returnedRows: [ReturnedRow] = []
+        let flaggedMetadata =
           try SyncMetadata
           .where { $0.recordName.in(recordNames) && $0._isDeleted }
-          .select { ($0.recordName, $0.zoneName, $0.ownerName, $0.lastKnownServerRecord, $0.share) }
+          .fetchAll(db)
+        for metadata in flaggedMetadata {
+          guard let table = tablesByName[metadata.recordType]
+          else { continue }
+          func open<T>(_: some SynchronizableTable<T>) throws -> Bool? {
+            let row =
+              try T
+              .unscoped
+              .where { #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)") }
+              .fetchOne(db)
+            guard let row
+            else { return nil }
+            guard
+              metadata.lastKnownServerRecord?.hasServerChangeTag == true,
+              let allFields = metadata._lastKnownServerRecordAllFields
+            else { return true }
+            return allFields.isModified(by: T(queryOutput: row))
+          }
+          guard let isChanged = try open(table)
+          else { continue }
+          returnedRows.append(ReturnedRow(metadata: metadata, isChanged: isChanged))
+        }
+        guard !returnedRows.isEmpty
+        else { return returnedRows }
+
+        // NB: Written as the sync engine, so no trigger queues anything. The saves are queued once
+        //     the rows have been fetched again, so that they are built on the current records.
+        let returnedRecordNames = returnedRows.map(\.metadata.recordName)
+        let changedRecordNames = returnedRows.filter(\.isChanged).map(\.metadata.recordName)
+        try SyncMetadata
+          .where { $0.recordName.in(returnedRecordNames) }
+          .update { $0._isDeleted = false }
+          .execute(db)
+        try SyncMetadata
+          .where { $0.recordName.in(changedRecordNames) }
+          .update { $0.userModificationTime = $currentTime() }
+          .execute(db)
+        try UnsyncedRecordID
+          .insert { returnedRows.map { UnsyncedRecordID(recordID: $0.recordID) } }
+          onConflictDoUpdate: { _ in }
+          .execute(db)
+        return returnedRows
+      }
+      guard !returnedRows.isEmpty
+      else { return }
+
+      syncEngines.withValue { syncEngines in
+        for returnedRow in returnedRows {
+          let syncEngine =
+            returnedRow.recordID.zoneID.ownerName == CKCurrentUserDefaultName
+            ? syncEngines.private
+            : syncEngines.shared
+          syncEngine?.state.remove(
+            pendingRecordZoneChanges: returnedRow.deletionRecordIDs.map { .deleteRecord($0) }
+          )
+        }
+      }
+
+      // NB: Fetches the returned rows again, as queued in 'UnsyncedRecordID'. A row whose record is
+      //     gone from the server stays until the fetch that delivers its deletion.
+      for isPrivate in Set(returnedRows.map(\.isPrivate)).sorted(by: { $0 && !$1 }) {
+        guard let syncEngine = syncEngines.withValue({ isPrivate ? $0.private : $0.shared })
+        else { continue }
+        await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+      }
+
+      syncEngines.withValue { syncEngines in
+        for returnedRow in returnedRows where returnedRow.isChanged {
+          let syncEngine = returnedRow.isPrivate ? syncEngines.private : syncEngines.shared
+          syncEngine?.state.add(pendingRecordZoneChanges: [.saveRecord(returnedRow.recordID)])
+        }
+      }
+    }
+
+    /// Settles the local deletions that are missing from the queue.
+    ///
+    /// The queue lives in CKSyncEngine's saved state, which can be lost, or saved before a
+    /// deletion was queued, and a deletion missing from it is never sent. The longer it was
+    /// missing, the likelier another device carried on with what it deleted: edited a record, or
+    /// added a record under one. Sending the deletion then would throw that away on every device,
+    /// since CloudKit deletes a parent even while other records point at it. So, once a fetch has
+    /// brought in the other devices' changes, each deletion (a flagged record with the flagged
+    /// records under it, all taken by one local delete) is checked against iCloud:
+    ///
+    /// * When its records are all as this device last knew them, it is queued again.
+    /// * When another device edited one of them, or added a record under one (it waits on this
+    ///   device for its missing parent), it is undone: everything it deleted is fetched back.
+    /// * A record no longer on the server needs nothing more, and neither does one that never
+    ///   reached it.
+    /// * When iCloud can't be reached, it waits for the next start.
+    private func settleLostDeletions(recordNames: [String]) async throws {
+      let queuedDeletionRecordIDs = syncEngines.withValue { syncEngines in
+        Set(
+          ((syncEngines.private?.state.pendingRecordZoneChanges ?? [])
+            + (syncEngines.shared?.state.pendingRecordZoneChanges ?? []))
+            .compactMap { change -> CKRecord.ID? in
+              guard case .deleteRecord(let recordID) = change
+              else { return nil }
+              return recordID
+            }
+        )
+      }
+      func lostDeletions() async throws -> [SyncMetadata] {
+        try await metadatabase.read { db in
+          try SyncMetadata
+            .where { $0.recordName.in(recordNames) && $0._isDeleted }
+            .fetchAll(db)
+        }
+        .filter { !$0.deletionRecordIDs.contains(where: queuedDeletionRecordIDs.contains) }
+      }
+
+      // NB: A record that never reached the server has nothing there to delete.
+      let neverSentRecordNames = try await lostDeletions()
+        .filter { $0.lastKnownServerRecord == nil }
+        .map { $0.recordName }
+      if !neverSentRecordNames.isEmpty {
+        try await userDatabase.write { db in
+          try SyncMetadata
+            .where { $0.recordName.in(neverSentRecordNames) && $0._isDeleted }
+            .delete()
+            .execute(db)
+        }
+      }
+      guard !(try await lostDeletions()).isEmpty
+      else { return }
+
+      // NB: Fetches first, so that the records other devices added under the deleted ones are on
+      //     this device, waiting for their parents, and the deletions they already sent are applied.
+      do {
+        for syncEngine in syncEngines.withValue({ [$0.private, $0.shared] }) {
+          try await syncEngine?.fetchChanges(CKSyncEngine.FetchChangesOptions())
+        }
+      } catch {
+        return
+      }
+      let lostMetadata = try await lostDeletions()
+      guard !lostMetadata.isEmpty
+      else { return }
+
+      let serverResults: [CKRecord.ID: Result<CKRecord, any Error>]
+      let waitingRecordResults: [CKRecord.ID: Result<CKRecord, any Error>]
+      do {
+        serverResults = try await serverRecords(for: lostMetadata.map { $0.zonedRecordID })
+        let unsyncedRecordIDs = try await metadatabase.read { db in
+          try UnsyncedRecordID.all.fetchAll(db).map(CKRecord.ID.init(unsyncedRecordID:))
+        }
+        waitingRecordResults = try await serverRecords(for: unsyncedRecordIDs)
+      } catch {
+        return
+      }
+      var waitedForRecordNames: Set<String> = []
+      for result in waitingRecordResults.values {
+        switch result {
+        case .success(let record):
+          waitedForRecordNames.formUnion(parentRecordNames(of: record))
+        case .failure(let error as CKError) where error.code == .unknownItem:
+          continue
+        case .failure:
+          // NB: A record waiting for a parent this device can't tell.
+          return
+        }
+      }
+
+      var goneRecordNames: [String] = []
+      var uncheckedRecordNames: Set<String> = []
+      var serverRecordsByName: [String: CKRecord] = [:]
+      for metadata in lostMetadata {
+        switch serverResults[metadata.zonedRecordID] {
+        case .success(let record):
+          serverRecordsByName[metadata.recordName] = record
+        case .failure(let error as CKError)
+        where error.code == .unknownItem || error.code == .zoneNotFound:
+          goneRecordNames.append(metadata.recordName)
+        case .failure, nil:
+          uncheckedRecordNames.insert(metadata.recordName)
+        }
+      }
+
+      let lostMetadataByRecordName = Dictionary(
+        lostMetadata.map { ($0.recordName, $0) },
+        uniquingKeysWith: { first, _ in first }
+      )
+      func deletedRoot(of recordName: String) -> String {
+        var recordName = recordName
+        var visitedRecordNames: Set<String> = [recordName]
+        while let parentRecordName = lostMetadataByRecordName[recordName]?.parentRecordName,
+          lostMetadataByRecordName[parentRecordName] != nil,
+          visitedRecordNames.insert(parentRecordName).inserted
+        {
+          recordName = parentRecordName
+        }
+        return recordName
+      }
+      var undoneRecordIDs: [CKRecord.ID] = []
+      var resentRecordNames: [String] = []
+      for deletion in Dictionary(grouping: lostMetadata, by: { deletedRoot(of: $0.recordName) })
+        .values
+      {
+        guard !deletion.contains(where: { uncheckedRecordNames.contains($0.recordName) })
+        else { continue }
+        let isOvertaken = deletion.contains { metadata in
+          guard !waitedForRecordNames.contains(metadata.recordName)
+          else { return true }
+          guard let serverRecord = serverRecordsByName[metadata.recordName]
+          else { return false }
+          guard let lastKnownFields = metadata._lastKnownServerRecordAllFields
+          else { return true }
+          return !serverRecord.hasSameFields(as: lastKnownFields)
+        }
+        for metadata in deletion {
+          guard let serverRecord = serverRecordsByName[metadata.recordName]
+          else { continue }
+          if isOvertaken {
+            undoneRecordIDs.append(serverRecord.recordID)
+          } else {
+            resentRecordNames.append(metadata.recordName)
+          }
+        }
+      }
+
+      try await userDatabase.write { [goneRecordNames, undoneRecordIDs, resentRecordNames] db in
+        let removedRecordNames = goneRecordNames + undoneRecordIDs.map(\.recordName)
+        try SyncMetadata
+          .where { $0.recordName.in(removedRecordNames) && $0._isDeleted }
+          .delete()
+          .execute(db)
+        if !undoneRecordIDs.isEmpty {
+          try UnsyncedRecordID
+            .insert { undoneRecordIDs.map { UnsyncedRecordID(recordID: $0) } }
+            onConflictDoUpdate: { _ in }
+            .execute(db)
+        }
+
+        // NB: Queued in a write, which cannot interleave with the confirmation of one of them: a
+        //     deletion confirmed in the meantime has lost its flag.
+        let resentMetadata =
+          try SyncMetadata
+          .where { $0.recordName.in(resentRecordNames) && $0._isDeleted }
           .fetchAll(db)
         var privateChanges: [CKSyncEngine.PendingRecordZoneChange] = []
         var sharedChanges: [CKSyncEngine.PendingRecordZoneChange] = []
-        for (recordName, zoneName, ownerName, lastKnownServerRecord, share) in deletions {
+        for metadata in resentMetadata {
           // NB: The same changes, and the same engine, as 'didDelete' queued them.
-          let zoneID =
-            lastKnownServerRecord?.recordID.zoneID
-            ?? CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
+          let zoneID = metadata.lastKnownServerRecord?.recordID.zoneID ?? metadata.zonedRecordID.zoneID
           var changes: [CKSyncEngine.PendingRecordZoneChange] = [
-            .deleteRecord(CKRecord.ID(recordName: recordName, zoneID: zoneID))
+            .deleteRecord(CKRecord.ID(recordName: metadata.recordName, zoneID: zoneID))
           ]
-          if let share {
+          if let share = metadata.share {
             changes.append(.deleteRecord(share.recordID))
           }
           if zoneID.ownerName == CKCurrentUserDefaultName {
@@ -719,6 +968,56 @@
           $0.shared?.state.add(pendingRecordZoneChanges: sharedChanges)
         }
       }
+
+      // NB: Fetches back what the undone deletions deleted, with what waits for it.
+      let undoneScopes = Set(undoneRecordIDs.map { $0.zoneID.ownerName == CKCurrentUserDefaultName })
+      for isPrivate in undoneScopes.sorted(by: { $0 && !$1 }) {
+        guard let syncEngine = syncEngines.withValue({ isPrivate ? $0.private : $0.shared })
+        else { continue }
+        await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
+      }
+    }
+
+    /// Fetches records from the database each one is in, in batches CloudKit accepts.
+    private func serverRecords(
+      for recordIDs: [CKRecord.ID]
+    ) async throws -> [CKRecord.ID: Result<CKRecord, any Error>] {
+      var results: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
+      let recordIDsByIsPrivate = Dictionary(grouping: recordIDs) {
+        $0.zoneID.ownerName == CKCurrentUserDefaultName
+      }
+      for (isPrivate, recordIDs) in recordIDsByIsPrivate {
+        guard let syncEngine = syncEngines.withValue({ isPrivate ? $0.private : $0.shared })
+        else { throw CKError(.notAuthenticated) }
+        for start in stride(from: 0, to: recordIDs.count, by: 150) {
+          let batch = Array(recordIDs.dropFirst(start).prefix(150))
+          results.merge(
+            try await syncEngine.database.records(for: batch),
+            uniquingKeysWith: { _, result in result }
+          )
+        }
+      }
+      return results
+    }
+
+    /// The names of the records a record points at: its parent, and every row its foreign keys
+    /// reference.
+    private func parentRecordNames(of record: CKRecord) -> Set<String> {
+      var recordNames: Set<String> = []
+      if let parent = record.parent {
+        recordNames.insert(parent.recordID.recordName)
+      }
+      for foreignKey in foreignKeysByTableName[record.recordType] ?? [] {
+        switch record.encryptedValues[foreignKey.from] {
+        case let value as String:
+          recordNames.insert("\(value):\(foreignKey.table)")
+        case let value as NSNumber:
+          recordNames.insert("\(value.stringValue):\(foreignKey.table)")
+        default:
+          continue
+        }
+      }
+      return recordNames
     }
 
     private func enqueueUnknownRecordsForCloudKit() async throws {
@@ -1299,6 +1598,31 @@
       var changes = syncEngine.state.pendingRecordZoneChanges.filter(options.scope.contains)
       guard !changes.isEmpty
       else { return [] }
+
+      // NB: A record whose row is on this device is never deleted on the server, and neither is
+      //     the share of a root whose row is: CloudKit deletes a parent even while other records
+      //     point at it, and every other device would then delete the row and everything under it.
+      //     Such a deletion comes from a queue older than the row's return (the saved state of an
+      //     older version, restored before 'keepReturnedRows' runs), so it leaves the queue unsent.
+      let keptRecordIDs = await recordIDsOfRowsOnDevice(
+        among: changes.compactMap { change -> CKRecord.ID? in
+          guard case .deleteRecord(let recordID) = change
+          else { return nil }
+          return recordID
+        }
+      )
+      if !keptRecordIDs.isEmpty {
+        changes.removeAll { change in
+          guard case .deleteRecord(let recordID) = change
+          else { return false }
+          return keptRecordIDs.contains(recordID)
+        }
+        syncEngine.state.remove(
+          pendingRecordZoneChanges: keptRecordIDs.map { .deleteRecord($0) }
+        )
+        guard !changes.isEmpty
+        else { return [] }
+      }
 
       let deletedRecordIDs: [CKRecord.ID] = changes.compactMap {
         switch $0 {
@@ -1980,6 +2304,14 @@
             try removeDeletionMetadata(for: finishedDeletionRecordIDs, db: db)
             if !deletedRecordIDs.isEmpty {
               try UnsyncedRecordID.findAll(deletedRecordIDs).delete().execute(db)
+              // NB: A row written again while its deletion was on its way has its flag cleared
+              //     (see 'SyncMetadata.insert'), and its metadata still names the record the
+              //     server just deleted. It goes up as a new record.
+              try SyncMetadata
+                .findAll(deletedRecordIDs)
+                .where { !$0._isDeleted }
+                .update { $0.setLastKnownServerRecord(nil) }
+                .execute(db)
             }
             return enqueuedUnsyncedRecordID
           }
@@ -2164,9 +2496,9 @@
     ///
     /// A deletion keeps its metadata, flagged with `_isDeleted`, until it leaves the queue, so that
     /// a fetch cannot write the deleted row back while the deletion is on its way (see
-    /// `upsertFromServerRecord`). A row created again with the same primary key while its deletion
-    /// was pending is queued to be uploaded as a new record, as it would have been had the deletion
-    /// already left the queue.
+    /// `upsertFromServerRecord`). Writing the row again clears the flag (see `SyncMetadata.insert`),
+    /// but a row an older version left on the device while flagged can still be here, until the
+    /// next start keeps it (see `keepReturnedRows`): it is queued to be uploaded as a new record.
     private func removeDeletionMetadata(
       for recordIDs: some Collection<CKRecord.ID>,
       db: Database
@@ -2210,6 +2542,57 @@
           open(table)
         }
       }
+    }
+
+    /// The records among some whose row is on this device, and the shares among them of roots
+    /// whose row is.
+    private func recordIDsOfRowsOnDevice(
+      among recordIDs: [CKRecord.ID]
+    ) async -> Set<CKRecord.ID> {
+      guard !recordIDs.isEmpty
+      else { return [] }
+      return await withErrorReporting(.sqliteDataCloudKitFailure) {
+        // NB: The records' metadata, keyed by the record ID a deletion of each is queued under: a
+        //     share's deletion goes by the share's ID.
+        let metadataByDeletedRecordID = try await metadatabase.read { db in
+          let metadata = try SyncMetadata.findAll(recordIDs).fetchAll(db)
+          var metadataByDeletedRecordID = Dictionary(
+            metadata.map { ($0.zonedRecordID, $0) },
+            uniquingKeysWith: { first, _ in first }
+          )
+          let otherRecordIDs = Set(recordIDs).subtracting(metadataByDeletedRecordID.keys)
+          if !otherRecordIDs.isEmpty {
+            for root in try SyncMetadata.where(\.isShared).fetchAll(db) {
+              guard
+                let shareRecordID = root.share?.recordID,
+                otherRecordIDs.contains(shareRecordID)
+              else { continue }
+              metadataByDeletedRecordID[shareRecordID] = root
+            }
+          }
+          return metadataByDeletedRecordID
+        }
+        guard !metadataByDeletedRecordID.isEmpty
+        else { return [] }
+        return try await userDatabase.read { db in
+          var keptRecordIDs: Set<CKRecord.ID> = []
+          for (recordID, metadata) in metadataByDeletedRecordID {
+            guard let table = tablesByName[metadata.recordType]
+            else { continue }
+            func open<T>(_: some SynchronizableTable<T>) throws -> Bool {
+              try T
+                .unscoped
+                .where { #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)") }
+                .fetchOne(db) != nil
+            }
+            if try open(table) {
+              keptRecordIDs.insert(recordID)
+            }
+          }
+          return keptRecordIDs
+        }
+      }
+        ?? []
     }
 
     /// Whether a record exists locally but the server has never confirmed a save of it.
@@ -2678,6 +3061,50 @@
       marked.remove(table)
       visited.insert(table)
       result[table.type.base.tableName] = result.count
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  extension SyncMetadata {
+    /// The record's ID, in the zone the metadata names.
+    fileprivate var zonedRecordID: CKRecord.ID {
+      CKRecord.ID(
+        recordName: recordName,
+        zoneID: CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
+      )
+    }
+
+    /// The IDs a deletion of the record can be queued under: 'didDelete' takes the zone of the
+    /// last known server record, which a zone change can leave behind the metadata's.
+    fileprivate var deletionRecordIDs: [CKRecord.ID] {
+      var recordIDs = [zonedRecordID]
+      if let lastKnownRecordID = lastKnownServerRecord?.recordID,
+        lastKnownRecordID != zonedRecordID
+      {
+        recordIDs.append(lastKnownRecordID)
+      }
+      return recordIDs
+    }
+  }
+
+  /// A row on the device whose metadata was flagged `_isDeleted` (see `keepReturnedRows`).
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private struct ReturnedRow: Sendable {
+    let metadata: SyncMetadata
+    /// Whether the row holds a change the server never received.
+    let isChanged: Bool
+
+    var recordID: CKRecord.ID {
+      metadata.zonedRecordID
+    }
+
+    var isPrivate: Bool {
+      recordID.zoneID.ownerName == CKCurrentUserDefaultName
+    }
+
+    /// The deletions of the row, and of its share, that may still be queued.
+    var deletionRecordIDs: [CKRecord.ID] {
+      metadata.deletionRecordIDs + (metadata.share.map { [$0.recordID] } ?? [])
     }
   }
 

@@ -175,8 +175,22 @@
     }
 
     package func add(pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange]) {
+      // NB: Like CKSyncEngine, which keeps only the last of a save and a deletion of the same
+      //     record: "If you add a [save] for recordA then [a delete], the sync engine discards the
+      //     save and sends only the delete change", and the other way around
+      //     (CKSyncEngineState.addPendingRecordZoneChanges).
       self._pendingRecordZoneChanges.withValue {
-        $0.append(contentsOf: pendingRecordZoneChanges)
+        for change in pendingRecordZoneChanges {
+          switch change {
+          case .saveRecord(let recordID):
+            $0.remove(.deleteRecord(recordID))
+          case .deleteRecord(let recordID):
+            $0.remove(.saveRecord(recordID))
+          @unknown default:
+            break
+          }
+          $0.append(change)
+        }
       }
     }
 

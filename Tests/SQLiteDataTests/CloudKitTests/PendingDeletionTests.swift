@@ -525,6 +525,135 @@
         }
       }
 
+      // * Local client creates a list, and it is sent.
+      // * Local client deletes the list, and creates it again with the same id before the
+      //   deletion is sent (an undo, for example).
+      // => The new list replaces the deletion in the queue, as CKSyncEngine does when a save of
+      //    a record follows its deletion. The server record is edited, and never deleted.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func rowCreatedAgainBeforeDeletionIsSentReplacesTheDeletion() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).delete().execute(db)
+        }
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Business")
+          }
+        }
+
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .saveRecord(RemindersList.recordID(for: 1))
+          ]
+        )
+        #expect(try await deletedRecordNames() == [])
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(
+          serverRecord(RemindersList.recordID(for: 1))?.encryptedValues["title"] as? String
+            == "Business"
+        )
+        #expect(serverDeletions() == [])
+        try await userDatabase.read { db in
+          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Business")])
+        }
+      }
+
+      // * Local client creates a list, and it is sent.
+      // * Local client deletes the list, creates it again with the same id, and renames it, all
+      //   before the deletion is sent.
+      // * The engine restarts.
+      // => The renamed list is sent as an edit, nothing is left flagged, and the restart queues
+      //    no deletion of it.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func rowCreatedAgainAndEditedBeforeDeletionIsSentIsNeverDeletedLater() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).delete().execute(db)
+        }
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Business")
+          }
+        }
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).update { $0.title = "Work" }.execute(db)
+        }
+
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .saveRecord(RemindersList.recordID(for: 1))
+          ]
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(
+          serverRecord(RemindersList.recordID(for: 1))?.encryptedValues["title"] as? String
+            == "Work"
+        )
+        #expect(try await deletedRecordNames() == [])
+
+        syncEngine.stop()
+        try await syncEngine.start()
+        try await syncEngine.processPendingDatabaseChanges(scope: .private)
+
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+        #expect(serverDeletions() == [])
+      }
+
+      // * Local client creates a list with a reminder, and both are sent.
+      // * Local client deletes the list, which deletes the reminder too, and creates both again
+      //   with the same ids before the deletions are sent (an undo, for example).
+      // => Both are sent as edits, and neither is ever deleted on the server.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func parentAndChildCreatedAgainBeforeDeletionIsSentAreNeverDeleted() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.userWrite { db in
+          try RemindersList.find(1).delete().execute(db)
+        }
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .saveRecord(RemindersList.recordID(for: 1)),
+            .saveRecord(Reminder.recordID(for: 1)),
+          ]
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        #expect(
+          serverRecordNames() == [RemindersList.recordName(for: 1), Reminder.recordName(for: 1)]
+        )
+        #expect(serverDeletions() == [])
+        #expect(try await deletedRecordNames() == [])
+      }
+
       /// The number of rows in the metadata table.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       private func metadataCount() async throws -> Int {

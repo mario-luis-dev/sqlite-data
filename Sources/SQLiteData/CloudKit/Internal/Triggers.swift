@@ -188,26 +188,44 @@
         "\(quote: defaultZone.zoneID.ownerName, delimiter: .text)",
         as: String.self
       )
-      return insert {
-        (
-          $0.recordPrimaryKey,
-          $0.recordType,
-          $0.zoneName,
-          $0.ownerName,
-          $0.parentRecordPrimaryKey,
-          $0.parentRecordType
-        )
-      } select: {
-        Values(
-          #sql("\(new.primaryKey)"),
-          T.tableName,
-          zoneName ?? defaultZoneName,
-          ownerName ?? defaultOwnerName,
-          parentRecordPrimaryKey,
-          parentRecordType
-        )
-      } onConflictDoUpdate: { _ in
-      }
+      return insert(
+        {
+          (
+            $0.recordPrimaryKey,
+            $0.recordType,
+            $0.zoneName,
+            $0.ownerName,
+            $0.parentRecordPrimaryKey,
+            $0.parentRecordType
+          )
+        },
+        select: {
+          Values(
+            #sql("\(new.primaryKey)"),
+            T.tableName,
+            zoneName ?? defaultZoneName,
+            ownerName ?? defaultOwnerName,
+            parentRecordPrimaryKey,
+            parentRecordType
+          )
+        },
+        onConflictDoUpdate: { metadata in
+          // NB: The row was deleted, and CloudKit hasn't confirmed the deletion. Writing it again
+          //     takes the deletion back, as a change made now: the metadata update trigger queues
+          //     a save, which CKSyncEngine sends instead of the queued deletion of the same
+          //     record. Left flagged, the row would be deleted on the server once the deletion is
+          //     sent, or at the next start, and fetches would skip other devices' edits of it.
+          metadata._isDeleted = false
+          metadata.zoneName = zoneName ?? metadata.zoneName
+          metadata.ownerName = ownerName ?? metadata.ownerName
+          metadata.parentRecordPrimaryKey = parentRecordPrimaryKey
+          metadata.parentRecordType = parentRecordType
+          metadata.userModificationTime = $currentTime()
+        },
+        where: {
+          $0._isDeleted
+        }
+      )
     }
 
     fileprivate static func update<T: PrimaryKeyedTable, Name>(
@@ -325,7 +343,9 @@
             )
           )
         } when: { old, new in
-          old._isDeleted.eq(new._isDeleted) && !SyncEngine.$isSynchronizing
+          // NB: Also when a row deleted locally is written again (see 'SyncMetadata.insert'),
+          //     which clears the flag.
+          (old._isDeleted.eq(new._isDeleted) || !new._isDeleted) && !SyncEngine.$isSynchronizing
         }
       )
     }

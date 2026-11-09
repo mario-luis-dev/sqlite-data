@@ -16,6 +16,11 @@
       package var storage: [CKRecordZone.ID: Zone] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
+      /// Every record this database has deleted. Unlike `deletedRecords`, which a fetch empties,
+      /// it is never cleared, so a test can tell whether a record was ever deleted.
+      package var deletionLog: [CKRecord.ID] = []
+      /// An error that `records(for:desiredKeys:)` throws, as when the device can't reach iCloud.
+      package var recordsLookupError: CKError?
       mutating func nextRecordChangeTag() -> Int {
         lastRecordChangeTag += 1
         return lastRecordChangeTag
@@ -81,6 +86,10 @@
 
       guard ids.count < 200
       else { throw CKError(.limitExceeded) }
+
+      if let error = state.withValue(\.recordsLookupError) {
+        throw error
+      }
 
       var results: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
       for id in ids {
@@ -291,6 +300,7 @@
           deleteResults[recordIDToDelete] = .success(())
           if let recordType = recordToDelete?.recordType {
             state.deletedRecords.append((recordIDToDelete, recordType))
+            state.deletionLog.append(recordIDToDelete)
           }
 
           // NB: If deleting a share that the current user owns, delete the shared records and all
@@ -311,6 +321,7 @@
                 state.storage[recordIDToDelete.zoneID]?.records[recordToDelete.recordID] = nil
                 deleteResults[recordToDelete.recordID] = .success(())
                 state.deletedRecords.append((recordIDToDelete, recordToDelete.recordType))
+                state.deletionLog.append(recordToDelete.recordID)
                 deleteRecords(referencing: recordToDelete.recordID)
               }
             }
